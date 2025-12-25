@@ -8,7 +8,6 @@
 // BlazeDB provides significant performance improvements over LevelDB:
 //   - 20x faster read speeds and 2.5x faster write speeds
 //   - 3-8x faster world loading via Z-order spatial indexing
-//   - 2-5x smaller world files via Minecraft-specific compression
 //   - 50% less RAM usage via hot-cold tiered caching
 //   - Parallel chunk loading using all CPU cores
 package blazedb
