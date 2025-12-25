@@ -538,14 +538,33 @@ func (db *DB) decodeColumn(data []byte, dim world.Dimension) (*chunk.Column, err
 	r.Read(compressedBiomes)
 	biomes := decompress(compressedBiomes, compression)
 
-	// Read and decompress subchunks
-	subChunks := make([][]byte, subCount)
-	for i := range subChunks {
+	// Read all compressed subchunk data FIRST (single sequential read)
+	compressedSubChunks := make([][]byte, subCount)
+	for i := range compressedSubChunks {
 		var subLen uint32
 		binary.Read(r, binary.LittleEndian, &subLen)
-		compressedSub := make([]byte, subLen)
-		r.Read(compressedSub)
-		subChunks[i] = decompress(compressedSub, compression)
+		compressedSubChunks[i] = make([]byte, subLen)
+		r.Read(compressedSubChunks[i])
+	}
+
+	// Decompress subchunks in PARALLEL
+	subChunks := make([][]byte, subCount)
+	if subCount >= 4 {
+		// Parallel decompression for chunks with 4+ subchunks
+		var wg sync.WaitGroup
+		wg.Add(int(subCount))
+		for i := range compressedSubChunks {
+			go func(idx int) {
+				defer wg.Done()
+				subChunks[idx] = decompress(compressedSubChunks[idx], compression)
+			}(i)
+		}
+		wg.Wait()
+	} else {
+		// Sequential for small chunks (goroutine overhead not worth it)
+		for i := range compressedSubChunks {
+			subChunks[i] = decompress(compressedSubChunks[i], compression)
+		}
 	}
 
 	// Decode chunk

@@ -66,6 +66,7 @@ func (c *chunkCache) shard(key chunkKey) *cacheShard {
 }
 
 // get retrieves a chunk from the cache, returning nil if not found.
+// Uses probabilistic LRU updates to avoid lock contention on every read.
 func (c *chunkCache) get(key chunkKey) *chunk.Column {
 	c.reads.Add(1)
 	shard := c.shard(key)
@@ -83,11 +84,17 @@ func (c *chunkCache) get(key chunkKey) *chunk.Column {
 
 	c.hits.Add(1)
 
-	// Move to front (write lock) - O(1) operation
-	shard.mu.Lock()
-	shard.lru.MoveToFront(elem)
-	entry.lastAccess = time.Now()
-	shard.mu.Unlock()
+	// Probabilistic LRU update: only move to front ~1/16 of the time
+	// This dramatically reduces write lock contention while maintaining
+	// approximate LRU ordering. Uses fast atomic counter instead of random.
+	if c.reads.Load()&0xF == 0 {
+		shard.mu.Lock()
+		// Double-check entry still exists (could have been evicted)
+		if _, exists := shard.entries[key]; exists {
+			shard.lru.MoveToFront(elem)
+		}
+		shard.mu.Unlock()
+	}
 
 	return col
 }
