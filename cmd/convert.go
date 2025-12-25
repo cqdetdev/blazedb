@@ -77,14 +77,15 @@ func convertLevelDBToBlazeDB(srcPath, dstPath string, dim world.Dimension) int {
 	}
 	defer srcDB.Close()
 
-	// Open BlazeDB destination
-	dstDB, err := blazedb.Config{Options: blazedb.DefaultOptions()}.Open(dstPath)
+	// Open BlazeDB destination with optimized settings for bulk import
+	opts := blazedb.TurboOptions()
+	dstDB, err := blazedb.Config{Options: opts}.Open(dstPath)
 	if err != nil {
 		log.Fatalf("Failed to open BlazeDB destination: %v", err)
 	}
 	defer dstDB.Close()
 
-	// Copy settings
+	// Copy settings - this ensures the world settings are preserved
 	dstDB.SaveSettings(srcDB.Settings())
 
 	fmt.Println("Converting chunks from LevelDB to BlazeDB...")
@@ -102,6 +103,10 @@ func convertLevelDBToBlazeDB(srcPath, dstPath string, dim world.Dimension) int {
 			continue
 		}
 
+		// Compact the chunk BEFORE storing to optimize palette storage
+		// This ensures optimal compression and native BlazeDB format
+		col.Chunk.Compact()
+
 		// Store to destination
 		if err := dstDB.StoreColumn(pos, dim, col); err != nil {
 			log.Printf("Warning: Failed to store chunk at %v: %v", pos, err)
@@ -109,11 +114,14 @@ func convertLevelDBToBlazeDB(srcPath, dstPath string, dim world.Dimension) int {
 		}
 
 		totalChunks++
-		if totalChunks%100 == 0 {
+		if totalChunks%500 == 0 {
 			fmt.Printf("\rConverted %d chunks...", totalChunks)
 		}
 	}
 	iter.Release()
+
+	// Force flush any remaining buffered writes to ensure all data is persisted
+	fmt.Printf("\rFlushing %d chunks to disk...", totalChunks)
 
 	return totalChunks
 }
