@@ -106,6 +106,8 @@ BlazeDB also caches negative area misses. In sparse repeated area scans, the ben
 
 For repeated same-position saves of unchanged chunks, BlazeDB keeps the last encoded hot record in the chunk cache and performs an exact byte comparison before committing a new record. In the targeted benchmark, `DurabilitySafe` unchanged saves dropped from about `548 us/op` before this optimization to about `5.47 us/op`, while `DurabilitySafeBatch` unchanged saves measured about `6.75 us/op`. Dense unchanged safe saves still pay Dragonfly encode cost and measured about `31.2 us/op`, but skip the expensive append/fsync step.
 
+Cache-size tuning benchmarks showed that `128MB` is the smallest tested cache setting that keeps a generated dense radius-32 working set hot after warm-up. In that benchmark, `64MB` was enough for radius-16, while radius-32 needed `128MB` to reach 100% cache hits and roughly 150 ns/op cached loads. Larger caches are still useful for multiple players in different areas.
+
 Safety mode store costs from the same benchmark run:
 
 | Mode | Store Cost | vs LevelDB Store | Recommended Use |
@@ -238,7 +240,7 @@ if err := iter.Error(); err != nil {
 
 | Option | Default | Description |
 | :--- | :--- | :--- |
-| `CacheSize` | `256MB` | Maximum memory usage for the chunk cache. |
+| `CacheSize` | `128MB` | Maximum memory usage for the chunk cache. |
 | `Compression` | `CompressionLZ4` | Compression algorithm (`LZ4`, `Snappy`, `None`). |
 | `WriteBufferSize` | `4MB` | Size of the in-memory write buffer before forcing a flush. |
 | `FlushInterval` | `1000ms` | Simple periodic background flushes. |

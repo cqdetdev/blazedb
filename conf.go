@@ -39,7 +39,8 @@ const (
 // Options holds configuration options for a BlazeDB database.
 type Options struct {
 	// CacheSize is the maximum number of bytes to use for in-memory caching.
-	// Defaults to 256MB. Higher values improve performance but use more RAM.
+	// Defaults to 128MB. Higher values improve performance for larger active
+	// working sets but use more RAM.
 	CacheSize int64
 
 	// Compression specifies the compression algorithm to use.
@@ -91,7 +92,7 @@ type Options struct {
 // Optimized for maximum write performance.
 func DefaultOptions() *Options {
 	return &Options{
-		CacheSize:           256 * 1024 * 1024, // 256MB
+		CacheSize:           128 * 1024 * 1024, // 128MB
 		Compression:         CompressionLZ4,    // Fastest
 		VerifyChecksums:     false,             // Skip for speed
 		WriteBufferSize:     4 * 1024 * 1024,   // 4MB buffer
@@ -109,7 +110,7 @@ func DefaultOptions() *Options {
 // BalancedOptions returns options balanced between speed and safety.
 func BalancedOptions() *Options {
 	return &Options{
-		CacheSize:           256 * 1024 * 1024,
+		CacheSize:           128 * 1024 * 1024,
 		Compression:         CompressionSnappy,
 		VerifyChecksums:     true,
 		WriteBufferSize:     2 * 1024 * 1024,

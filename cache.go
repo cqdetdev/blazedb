@@ -21,6 +21,8 @@ type chunkCache struct {
 }
 
 const cacheShardCount = 16
+const estimatedSubChunkCacheBytes = 1024
+const estimatedColumnBaseBytes = 1024
 
 // cacheShard is a single shard of the cache.
 type cacheShard struct {
@@ -53,6 +55,20 @@ func newChunkCache(maxSize int64) *chunkCache {
 		}
 	}
 	return c
+}
+
+func estimateCacheEntrySize(col *chunk.Column, record []byte) int64 {
+	size := int64(estimatedColumnBaseBytes + len(record))
+	if col != nil && col.Chunk != nil {
+		size += int64(len(col.Chunk.Sub()) * estimatedSubChunkCacheBytes)
+	}
+	size += int64(len(col.Entities) * 256)
+	size += int64(len(col.BlockEntities) * 256)
+	size += int64(len(col.ScheduledBlocks) * 64)
+	if size < int64(len(record)) {
+		return int64(len(record))
+	}
+	return size
 }
 
 // shard returns the shard for a given key using fast hash.
@@ -100,16 +116,13 @@ func (c *chunkCache) put(key chunkKey, col *chunk.Column) {
 	c.writes.Add(1)
 	shard := c.shard(key)
 
-	// Estimate size
-	size := int64(len(col.Chunk.Sub()) * 4096 * 2)
-
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
 	// Update existing entry
 	if elem, ok := shard.entries[key]; ok {
 		entry := elem.Value.(*cacheEntry)
-		size += int64(len(entry.record))
+		size := estimateCacheEntrySize(col, entry.record)
 		shard.size.Add(size - entry.size)
 		entry.col = col
 		entry.size = size
@@ -126,6 +139,8 @@ func (c *chunkCache) put(key chunkKey, col *chunk.Column) {
 		}
 		return
 	}
+
+	size := estimateCacheEntrySize(col, nil)
 
 	// Evict if needed - O(1) eviction from back
 	for shard.size.Load()+size > shard.maxSize && shard.lru.Len() > 0 {
@@ -157,21 +172,19 @@ func (c *chunkCache) putClean(key chunkKey, col *chunk.Column) {
 
 func (c *chunkCache) putCleanWithRecord(key chunkKey, col *chunk.Column, record []byte) {
 	shard := c.shard(key)
-	size := int64(len(col.Chunk.Sub()) * 4096 * 2)
-	if record != nil {
-		size += int64(len(record))
-	}
 
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
 	if elem, ok := shard.entries[key]; ok {
 		entry := elem.Value.(*cacheEntry)
+		nextRecord := record
 		if record == nil {
-			size += int64(len(entry.record))
+			nextRecord = entry.record
 		} else {
 			entry.record = record
 		}
+		size := estimateCacheEntrySize(col, nextRecord)
 		shard.size.Add(size - entry.size)
 		entry.col = col
 		entry.size = size
@@ -188,6 +201,8 @@ func (c *chunkCache) putCleanWithRecord(key chunkKey, col *chunk.Column, record 
 		}
 		return
 	}
+
+	size := estimateCacheEntrySize(col, record)
 
 	// Evict if needed
 	for shard.size.Load()+size > shard.maxSize && shard.lru.Len() > 0 {

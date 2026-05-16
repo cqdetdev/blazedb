@@ -1,27 +1,21 @@
-package blazedb
+package tests
 
 import (
-	"io"
-	"log/slog"
-	"os"
 	"testing"
 
+	"github.com/cqdetdev/blazedb"
 	"github.com/df-mc/dragonfly/server/world"
 	"github.com/df-mc/dragonfly/server/world/chunk"
 )
 
-func discardTestLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
-}
-
 func TestCompactRewritesLiveChunks(t *testing.T) {
-	opts := DefaultOptions()
+	opts := blazedb.DefaultOptions()
 	opts.WriteBufferSize = 0
 	opts.FlushInterval = 0
-	opts.Log = discardTestLogger()
+	opts.Log = discardLogger()
 
 	dir := t.TempDir()
-	db, err := Config{Options: opts}.Open(dir)
+	db, err := blazedb.Config{Options: opts}.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,19 +34,13 @@ func TestCompactRewritesLiveChunks(t *testing.T) {
 		}
 	}
 
-	before, err := os.Stat(dataPath(dir))
-	if err != nil {
-		t.Fatal(err)
-	}
+	before := dataSize(t, dir)
 	if err := db.Compact(); err != nil {
 		t.Fatal(err)
 	}
-	after, err := os.Stat(dataPath(dir))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if after.Size() >= before.Size() {
-		t.Fatalf("expected compaction to shrink data file: before=%d after=%d", before.Size(), after.Size())
+	after := dataSize(t, dir)
+	if after >= before {
+		t.Fatalf("expected compaction to shrink data file: before=%d after=%d", before, after)
 	}
 
 	for _, pos := range positions {
