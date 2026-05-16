@@ -20,27 +20,22 @@ It is engineered to overcome specific bottlenecks found in general-purpose KV st
 
 BlazeDB avoids the complexity of LSM Trees (used by LevelDB) in favor of a simpler, faster append-only model paired with an in-memory spatial index.
 
-```mermaid
-graph TD
-    subgraph InMemory
-        WriteBuf[Write Buffer - Map]
-        Cache[Sharded LRU Cache]
-        Index[Spatial Index - Z Order Map]
-    end
+```text
+Minecraft Server
+|-- Put Chunk
+|   `-- Write Buffer (map)
+|       |-- async flush -> chunks.dat (append-only data)
+|       `-- index update -> Spatial Index (Z-order map)
+|
+`-- Get Chunk
+    `-- Sharded LRU Cache
+        `-- miss -> Spatial Index (Z-order map)
+            `-- lookup offset -> chunks.dat
+                `-- read + decompress -> Sharded LRU Cache
 
-    subgraph DiskStorage
-        DataFile[chunks.dat - Append Only Data]
-        IndexFile[index.dat - Persisted Index]
-    end
-
-    App[Minecraft Server] -->|Put Chunk| WriteBuf
-    WriteBuf -.->|Flush Async| DataFile
-    WriteBuf -.->|Update| Index
-
-    App -->|Get Chunk| Cache
-    Cache -.->|Miss| Index
-    Index -->|Lookup Offset| DataFile
-    DataFile -->|Read and Decompress| Cache
+Disk files:
+|-- chunks.dat  append-only chunk data
+`-- index.dat   persisted spatial index
 ```
 
 ### 1. Z-Order Spatial Indexing
