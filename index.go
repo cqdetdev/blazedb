@@ -1,8 +1,10 @@
 package blazedb
 
 import (
+	"bufio"
 	"encoding/binary"
 	"os"
+	"sort"
 	"sync"
 
 	"github.com/df-mc/dragonfly/server/world"
@@ -12,7 +14,12 @@ import (
 // using Z-order (Morton) curve encoding for spatial locality.
 type spatialIndex struct {
 	mu      sync.RWMutex
-	entries map[uint64]indexEntry // Morton code -> entry
+	entries map[indexKey]indexEntry
+}
+
+type indexKey struct {
+	morton uint64
+	dim    int32
 }
 
 // indexEntry holds the file offset and size of a chunk.
@@ -22,10 +29,21 @@ type indexEntry struct {
 	dim    int32
 }
 
+type indexUpdate struct {
+	key    chunkKey
+	offset int64
+	size   int64
+}
+
+type indexSnapshotEntry struct {
+	key   indexKey
+	entry indexEntry
+}
+
 // newSpatialIndex creates a new spatial index.
 func newSpatialIndex() *spatialIndex {
 	return &spatialIndex{
-		entries: make(map[uint64]indexEntry),
+		entries: make(map[indexKey]indexEntry),
 	}
 }
 
@@ -86,14 +104,18 @@ func makeKey(key chunkKey) (uint64, int32) {
 	return morton, int32(dimID)
 }
 
+func indexLookupKey(key chunkKey) (uint64, int32) {
+	morton, dimID := makeKey(key)
+	return morton, dimID
+}
+
 // get retrieves the offset and size for a chunk, returning false if not found.
 func (idx *spatialIndex) get(key chunkKey) (offset, size int64, exists bool) {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
-	morton, dimID := makeKey(key)
-	// Include dimension in lookup key
-	lookupKey := morton ^ (uint64(dimID) << 48)
+	morton, dimID := indexLookupKey(key)
+	lookupKey := indexKey{morton: morton, dim: dimID}
 
 	entry, ok := idx.entries[lookupKey]
 	if !ok {
@@ -107,8 +129,8 @@ func (idx *spatialIndex) put(key chunkKey, offset, size int64) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
-	morton, dimID := makeKey(key)
-	lookupKey := morton ^ (uint64(dimID) << 48)
+	morton, dimID := indexLookupKey(key)
+	lookupKey := indexKey{morton: morton, dim: dimID}
 
 	idx.entries[lookupKey] = indexEntry{
 		offset: offset,
@@ -117,13 +139,29 @@ func (idx *spatialIndex) put(key chunkKey, offset, size int64) {
 	}
 }
 
+// putBatch adds or updates multiple entries while holding the index lock once.
+func (idx *spatialIndex) putBatch(updates []indexUpdate) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	for _, update := range updates {
+		morton, dimID := indexLookupKey(update.key)
+		lookupKey := indexKey{morton: morton, dim: dimID}
+		idx.entries[lookupKey] = indexEntry{
+			offset: update.offset,
+			size:   update.size,
+			dim:    dimID,
+		}
+	}
+}
+
 // delete removes an entry from the index.
 func (idx *spatialIndex) delete(key chunkKey) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
-	morton, dimID := makeKey(key)
-	lookupKey := morton ^ (uint64(dimID) << 48)
+	morton, dimID := indexLookupKey(key)
+	lookupKey := indexKey{morton: morton, dim: dimID}
 	delete(idx.entries, lookupKey)
 }
 
@@ -138,27 +176,29 @@ func (idx *spatialIndex) save(path string) error {
 	}
 	defer f.Close()
 
+	w := bufio.NewWriterSize(f, 256*1024)
+
 	// Write header: magic + count
 	header := make([]byte, 12)
 	copy(header[:4], "BIDX")
 	binary.LittleEndian.PutUint64(header[4:], uint64(len(idx.entries)))
-	if _, err := f.Write(header); err != nil {
+	if _, err := w.Write(header); err != nil {
 		return err
 	}
 
 	// Write entries: key (8) + offset (8) + size (8) + dim (4) = 28 bytes each
 	entry := make([]byte, 28)
 	for key, e := range idx.entries {
-		binary.LittleEndian.PutUint64(entry[0:], key)
+		binary.LittleEndian.PutUint64(entry[0:], key.morton)
 		binary.LittleEndian.PutUint64(entry[8:], uint64(e.offset))
 		binary.LittleEndian.PutUint64(entry[16:], uint64(e.size))
 		binary.LittleEndian.PutUint32(entry[24:], uint32(e.dim))
-		if _, err := f.Write(entry); err != nil {
+		if _, err := w.Write(entry); err != nil {
 			return err
 		}
 	}
 
-	return nil
+	return w.Flush()
 }
 
 // load reads the index from a file.
@@ -181,16 +221,16 @@ func (idx *spatialIndex) load(path string) error {
 		return os.ErrInvalid
 	}
 
-	idx.entries = make(map[uint64]indexEntry, count)
+	idx.entries = make(map[indexKey]indexEntry, count)
 
 	for i := uint64(0); i < count; i++ {
 		off := 12 + i*28
-		key := binary.LittleEndian.Uint64(data[off:])
+		morton := binary.LittleEndian.Uint64(data[off:])
 		offset := int64(binary.LittleEndian.Uint64(data[off+8:]))
 		size := int64(binary.LittleEndian.Uint64(data[off+16:]))
 		dim := int32(binary.LittleEndian.Uint32(data[off+24:]))
 
-		idx.entries[key] = indexEntry{
+		idx.entries[indexKey{morton: morton, dim: dim}] = indexEntry{
 			offset: offset,
 			size:   size,
 			dim:    dim,
@@ -207,23 +247,62 @@ func (idx *spatialIndex) count() int {
 	return len(idx.entries)
 }
 
+func (idx *spatialIndex) snapshotSorted() []indexSnapshotEntry {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+
+	entries := make([]indexSnapshotEntry, 0, len(idx.entries))
+	for key, entry := range idx.entries {
+		entries = append(entries, indexSnapshotEntry{key: key, entry: entry})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].key.dim != entries[j].key.dim {
+			return entries[i].key.dim < entries[j].key.dim
+		}
+		return entries[i].key.morton < entries[j].key.morton
+	})
+	return entries
+}
+
+func (idx *spatialIndex) replace(entries []indexSnapshotEntry) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	next := make(map[indexKey]indexEntry, len(entries))
+	for _, snapshot := range entries {
+		next[snapshot.key] = snapshot.entry
+	}
+	idx.entries = next
+}
+
 // iterate calls fn for each entry in the index in Morton order.
 func (idx *spatialIndex) iterate(fn func(key chunkKey, offset, size int64) bool) {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
-	for code, entry := range idx.entries {
-		// Extract dimension and Morton code
-		morton := code & 0x0000FFFFFFFFFFFF
-		x, z := mortonDecode(morton)
+	keys := make([]indexKey, 0, len(idx.entries))
+	for key := range idx.entries {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].dim != keys[j].dim {
+			return keys[i].dim < keys[j].dim
+		}
+		return keys[i].morton < keys[j].morton
+	})
 
-		dim, _ := world.DimensionByID(int(entry.dim))
-		key := chunkKey{
+	for _, idxKey := range keys {
+		entry := idx.entries[idxKey]
+
+		x, z := mortonDecode(idxKey.morton)
+
+		dim, _ := world.DimensionByID(int(idxKey.dim))
+		chunk := chunkKey{
 			pos: world.ChunkPos{x, z},
 			dim: dim,
 		}
 
-		if !fn(key, entry.offset, entry.size) {
+		if !fn(chunk, entry.offset, entry.size) {
 			return
 		}
 	}

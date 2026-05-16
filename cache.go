@@ -68,7 +68,7 @@ func (c *chunkCache) shard(key chunkKey) *cacheShard {
 // get retrieves a chunk from the cache, returning nil if not found.
 // Uses probabilistic LRU updates to avoid lock contention on every read.
 func (c *chunkCache) get(key chunkKey) *chunk.Column {
-	c.reads.Add(1)
+	readCount := c.reads.Add(1)
 	shard := c.shard(key)
 
 	shard.mu.RLock()
@@ -87,7 +87,7 @@ func (c *chunkCache) get(key chunkKey) *chunk.Column {
 	// Probabilistic LRU update: only move to front ~1/16 of the time
 	// This dramatically reduces write lock contention while maintaining
 	// approximate LRU ordering. Uses fast atomic counter instead of random.
-	if c.reads.Load()&0xF == 0 {
+	if readCount&0xF == 0 {
 		shard.mu.Lock()
 		// Double-check entry still exists (could have been evicted)
 		if _, exists := shard.entries[key]; exists {
@@ -113,10 +113,22 @@ func (c *chunkCache) put(key chunkKey, col *chunk.Column) {
 	// Update existing entry
 	if elem, ok := shard.entries[key]; ok {
 		entry := elem.Value.(*cacheEntry)
+		shard.size.Add(size - entry.size)
 		entry.col = col
 		entry.lastAccess = time.Now()
+		entry.size = size
 		entry.dirty = true
 		shard.lru.MoveToFront(elem)
+		for shard.size.Load() > shard.maxSize && shard.lru.Len() > 0 {
+			oldest := shard.lru.Back()
+			if oldest == nil || oldest == elem {
+				break
+			}
+			oldEntry := oldest.Value.(*cacheEntry)
+			shard.size.Add(-oldEntry.size)
+			delete(shard.entries, oldEntry.key)
+			shard.lru.Remove(oldest)
+		}
 		return
 	}
 
@@ -152,6 +164,27 @@ func (c *chunkCache) putClean(key chunkKey, col *chunk.Column) {
 
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
+
+	if elem, ok := shard.entries[key]; ok {
+		entry := elem.Value.(*cacheEntry)
+		shard.size.Add(size - entry.size)
+		entry.col = col
+		entry.lastAccess = time.Now()
+		entry.size = size
+		entry.dirty = false
+		shard.lru.MoveToFront(elem)
+		for shard.size.Load() > shard.maxSize && shard.lru.Len() > 0 {
+			oldest := shard.lru.Back()
+			if oldest == nil || oldest == elem {
+				break
+			}
+			oldEntry := oldest.Value.(*cacheEntry)
+			shard.size.Add(-oldEntry.size)
+			delete(shard.entries, oldEntry.key)
+			shard.lru.Remove(oldest)
+		}
+		return
+	}
 
 	// Evict if needed
 	for shard.size.Load()+size > shard.maxSize && shard.lru.Len() > 0 {

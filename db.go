@@ -6,8 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,6 +36,7 @@ type DB struct {
 	ldat   *leveldat.Data
 	set    *world.Settings
 	cache  *chunkCache
+	misses *negativeCache
 	index  *spatialIndex
 	dataFd *os.File
 	mu     sync.RWMutex
@@ -42,6 +46,7 @@ type DB struct {
 
 	// Write buffer for batched writes - stores raw columns for lazy encoding
 	writeBuf     map[chunkKey]*chunk.Column
+	flushingBuf  map[chunkKey]*chunk.Column
 	writeBufMu   sync.Mutex
 	writeBufSize atomic.Int64 // Estimated buffer size tracking
 	flushTimer   *time.Timer
@@ -66,6 +71,20 @@ type writeRequest struct {
 	col *chunk.Column
 }
 
+// pendingWrite is a buffered column prepared for sequential disk append.
+type pendingWrite struct {
+	key      chunkKey
+	sortKey  uint64
+	data     []byte
+	dataSize int64
+}
+
+type pendingEncode struct {
+	key     chunkKey
+	sortKey uint64
+	col     *chunk.Column
+}
+
 // Open creates a new provider reading and writing from/to files under the path
 // passed using default options.
 func Open(dir string) (*DB, error) {
@@ -81,11 +100,13 @@ func newDB(conf Config, dir string) (*DB, error) {
 		ldat:         &leveldat.Data{},
 		playerSpawns: make(map[uuid.UUID]cube.Pos),
 		writeBuf:     make(map[chunkKey]*chunk.Column),
+		flushingBuf:  make(map[chunkKey]*chunk.Column),
 		stopFlush:    make(chan struct{}),
 	}
 
 	// Initialize cache
 	db.cache = newChunkCache(conf.Options.CacheSize)
+	db.misses = newNegativeCache()
 
 	// Initialize or load spatial index
 	db.index = newSpatialIndex()
@@ -223,39 +244,144 @@ func (db *DB) flushWriteBuffer() {
 
 	// Copy buffer and clear
 	toWrite := db.writeBuf
+	for key, col := range toWrite {
+		db.flushingBuf[key] = col
+	}
 	db.writeBuf = make(map[chunkKey]*chunk.Column)
 	db.writeBufSize.Store(0) // Reset atomic buffer size
 	db.writeBufMu.Unlock()
+	defer db.clearFlushingBuffer(toWrite)
+
+	writes := db.encodePendingWrites(toWrite)
+	if len(writes) == 0 {
+		return
+	}
+
+	totalSize := 0
+	for _, write := range writes {
+		totalSize += len(write.data)
+	}
+
+	sort.Slice(writes, func(i, j int) bool {
+		return writes[i].sortKey < writes[j].sortKey
+	})
 
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
+	offset := db.fileOffset.Load()
+	batch := make([]byte, 0, totalSize)
+	updates := make([]indexUpdate, 0, len(writes))
+	for _, write := range writes {
+		writeOffset := offset + int64(len(batch))
+		batch = append(batch, write.data...)
+		updates = append(updates, indexUpdate{
+			key:    write.key,
+			offset: writeOffset,
+			size:   write.dataSize,
+		})
+	}
+
+	if _, err := db.dataFd.WriteAt(batch, offset); err != nil {
+		db.conf.Options.Log.Error("flush: write chunk batch", "error", err)
+		return
+	}
+
+	offset += int64(len(batch))
+	db.fileOffset.Store(offset)
+	db.index.putBatch(updates)
+	for _, write := range writes {
+		db.cache.markClean(write.key)
+	}
+}
+
+func (db *DB) encodePendingWrites(toWrite map[chunkKey]*chunk.Column) []pendingWrite {
+	tasks := make([]pendingEncode, 0, len(toWrite))
 	for key, col := range toWrite {
-		// Lazy encoding: encode now at flush time instead of on every write
-		data, err := db.encodeColumn(key.pos, key.dim, col)
+		sortKey, _ := indexLookupKey(key)
+		tasks = append(tasks, pendingEncode{key: key, sortKey: sortKey, col: col})
+	}
+	sort.Slice(tasks, func(i, j int) bool {
+		return tasks[i].sortKey < tasks[j].sortKey
+	})
+
+	if !db.conf.Options.ParallelCompression || len(tasks) < 32 {
+		return db.encodePendingWritesSequential(tasks)
+	}
+
+	workers := runtime.GOMAXPROCS(0)
+	if workers > len(tasks) {
+		workers = len(tasks)
+	}
+	if workers < 2 {
+		return db.encodePendingWritesSequential(tasks)
+	}
+
+	writes := make([]pendingWrite, len(tasks))
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				task := tasks[idx]
+				data, err := db.encodeColumn(task.key.pos, task.key.dim, task.col)
+				if err != nil {
+					db.conf.Options.Log.Error("flush: encode chunk", "error", err)
+					continue
+				}
+				writes[idx] = pendingWrite{
+					key:      task.key,
+					sortKey:  task.sortKey,
+					data:     data,
+					dataSize: int64(len(data)),
+				}
+			}
+		}()
+	}
+	for i := range tasks {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+
+	n := 0
+	for _, write := range writes {
+		if write.data != nil {
+			writes[n] = write
+			n++
+		}
+	}
+	return writes[:n]
+}
+
+func (db *DB) encodePendingWritesSequential(tasks []pendingEncode) []pendingWrite {
+	writes := make([]pendingWrite, 0, len(tasks))
+	for _, task := range tasks {
+		data, err := db.encodeColumn(task.key.pos, task.key.dim, task.col)
 		if err != nil {
 			db.conf.Options.Log.Error("flush: encode chunk", "error", err)
 			continue
 		}
-
-		// Use atomic offset instead of Stat() syscall
-		offset := db.fileOffset.Load()
-
-		// Write to disk
-		if _, err := db.dataFd.WriteAt(data, offset); err != nil {
-			db.conf.Options.Log.Error("flush: write chunk", "error", err)
-			continue
-		}
-
-		// Atomically update file offset
-		db.fileOffset.Add(int64(len(data)))
-
-		// Update index
-		db.index.put(key, offset, int64(len(data)))
-
-		// Mark chunk as clean in cache
-		db.cache.markClean(key)
+		writes = append(writes, pendingWrite{
+			key:      task.key,
+			sortKey:  task.sortKey,
+			data:     data,
+			dataSize: int64(len(data)),
+		})
 	}
+	return writes
+}
+
+func (db *DB) clearFlushingBuffer(flushed map[chunkKey]*chunk.Column) {
+	db.writeBufMu.Lock()
+	for key, col := range flushed {
+		if db.flushingBuf[key] == col {
+			delete(db.flushingBuf, key)
+		}
+	}
+	db.writeBufMu.Unlock()
 }
 
 // Settings returns the world.Settings of the world loaded by the DB.
@@ -296,6 +422,12 @@ func (db *DB) LoadColumn(pos world.ChunkPos, dim world.Dimension) (*chunk.Column
 		return col, nil
 	}
 
+	return db.loadColumnAfterCacheMiss(key, dim)
+}
+
+// loadColumnAfterCacheMiss loads a column when the caller has already checked
+// the chunk cache. This keeps batched area loads from double-counting misses.
+func (db *DB) loadColumnAfterCacheMiss(key chunkKey, dim world.Dimension) (*chunk.Column, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
@@ -306,11 +438,17 @@ func (db *DB) LoadColumn(pos world.ChunkPos, dim world.Dimension) (*chunk.Column
 		db.cache.putClean(key, col)
 		return col, nil
 	}
+	if col, ok := db.flushingBuf[key]; ok {
+		db.writeBufMu.Unlock()
+		db.cache.putClean(key, col)
+		return col, nil
+	}
 	db.writeBufMu.Unlock()
 
 	// Load from disk using spatial index
 	offset, size, exists := db.index.get(key)
 	if !exists {
+		db.misses.put(key)
 		return nil, ErrNotFound
 	}
 
@@ -337,6 +475,7 @@ func (db *DB) StoreColumn(pos world.ChunkPos, dim world.Dimension, col *chunk.Co
 	key := chunkKey{pos: pos, dim: dim}
 
 	// Update cache immediately
+	db.misses.delete(key)
 	db.cache.put(key, col)
 
 	// If write buffering is enabled, send to async write queue (non-blocking)
@@ -347,6 +486,10 @@ func (db *DB) StoreColumn(pos world.ChunkPos, dim world.Dimension, col *chunk.Co
 		default:
 			// Queue full - add directly to buffer (fallback)
 			db.writeBufMu.Lock()
+			estimatedSize := int64(len(col.Chunk.Sub()) * 4096)
+			if _, exists := db.writeBuf[key]; !exists {
+				db.writeBufSize.Add(estimatedSize)
+			}
 			db.writeBuf[key] = col
 			db.writeBufMu.Unlock()
 		}
@@ -380,19 +523,55 @@ func (db *DB) StoreColumn(pos world.ChunkPos, dim world.Dimension, col *chunk.Co
 // LoadArea loads multiple chunks in the given radius around center position.
 // This is optimized for fast render distance loading.
 func (db *DB) LoadArea(center world.ChunkPos, radius int, dim world.Dimension) ([]*chunk.Column, error) {
-	var columns []*chunk.Column
+	total := (radius*2 + 1) * (radius*2 + 1)
+	columns := make([]*chunk.Column, 0, total)
+	missing := make([]chunkKey, 0)
+
+	for dx := -radius; dx <= radius; dx++ {
+		for dz := -radius; dz <= radius; dz++ {
+			key := chunkKey{
+				pos: world.ChunkPos{center[0] + int32(dx), center[1] + int32(dz)},
+				dim: dim,
+			}
+			if col := db.cache.get(key); col != nil {
+				columns = append(columns, col)
+				continue
+			}
+			if db.misses.has(key) {
+				continue
+			}
+			missing = append(missing, key)
+		}
+	}
+
+	if len(missing) == 0 {
+		return columns, nil
+	}
+	sort.Slice(missing, func(i, j int) bool {
+		left, _ := indexLookupKey(missing[i])
+		right, _ := indexLookupKey(missing[j])
+		return left < right
+	})
+
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	errCh := make(chan error, 1)
 
-	// Load chunks in parallel
-	for dx := -radius; dx <= radius; dx++ {
-		for dz := -radius; dz <= radius; dz++ {
-			pos := world.ChunkPos{center[0] + int32(dx), center[1] + int32(dz)}
-			wg.Add(1)
-			go func(p world.ChunkPos) {
-				defer wg.Done()
-				col, err := db.LoadColumn(p, dim)
+	workers := runtime.GOMAXPROCS(0)
+	if workers > len(missing) {
+		workers = len(missing)
+	}
+	if workers < 1 {
+		workers = 1
+	}
+
+	jobs := make(chan chunkKey)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for key := range jobs {
+				col, err := db.loadColumnAfterCacheMiss(key, dim)
 				if err != nil {
 					if !errors.Is(err, ErrNotFound) {
 						select {
@@ -400,14 +579,18 @@ func (db *DB) LoadArea(center world.ChunkPos, radius int, dim world.Dimension) (
 						default:
 						}
 					}
-					return
+					continue
 				}
 				mu.Lock()
 				columns = append(columns, col)
 				mu.Unlock()
-			}(pos)
-		}
+			}
+		}()
 	}
+	for _, key := range missing {
+		jobs <- key
+	}
+	close(jobs)
 
 	wg.Wait()
 	close(errCh)
@@ -421,65 +604,69 @@ func (db *DB) LoadArea(center world.ChunkPos, radius int, dim world.Dimension) (
 
 // encodeColumn encodes a chunk column to compressed bytes.
 func (db *DB) encodeColumn(pos world.ChunkPos, dim world.Dimension, col *chunk.Column) ([]byte, error) {
-	buf := bytes.NewBuffer(nil)
-
-	// Write header: "BLAZ" magic
-	buf.Write([]byte("BLAZ"))
-
 	// Encode chunk data
 	data := chunk.Encode(col.Chunk, chunk.DiskEncoding)
 
+	capacity := 26 + len(data.Biomes)
+	for _, sub := range data.SubChunks {
+		capacity += 4 + len(sub)
+	}
+	buf := make([]byte, 0, capacity)
+
+	// Write header: "BLAZ" magic
+	buf = append(buf, 'B', 'L', 'A', 'Z')
+
 	// Placeholder for size (will be filled after compression)
-	sizePos := buf.Len()
-	binary.Write(buf, binary.LittleEndian, uint32(0))
+	sizePos := len(buf)
+	buf = binary.LittleEndian.AppendUint32(buf, 0)
 
 	// Placeholder for CRC32
-	crcPos := buf.Len()
-	binary.Write(buf, binary.LittleEndian, uint32(0))
+	crcPos := len(buf)
+	buf = binary.LittleEndian.AppendUint32(buf, 0)
 
 	// Write coordinates
-	binary.Write(buf, binary.LittleEndian, pos[0])
-	binary.Write(buf, binary.LittleEndian, pos[1])
+	buf = binary.LittleEndian.AppendUint32(buf, uint32(pos[0]))
+	buf = binary.LittleEndian.AppendUint32(buf, uint32(pos[1]))
 
 	// Write dimension ID
 	dimID, _ := world.DimensionID(dim)
-	binary.Write(buf, binary.LittleEndian, int32(dimID))
+	buf = binary.LittleEndian.AppendUint32(buf, uint32(dimID))
 
 	// Write compression type
-	buf.WriteByte(byte(db.conf.Options.Compression))
+	buf = append(buf, byte(db.conf.Options.Compression))
 
 	// Write subchunk count
-	buf.WriteByte(byte(len(data.SubChunks)))
+	buf = append(buf, byte(len(data.SubChunks)))
+
+	appendBytes := func(payload []byte) {
+		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(payload)))
+		buf = append(buf, payload...)
+	}
 
 	// Compress and write biomes
 	compressedBiomes := compress(data.Biomes, db.conf.Options.Compression)
-	binary.Write(buf, binary.LittleEndian, uint32(len(compressedBiomes)))
-	buf.Write(compressedBiomes)
+	appendBytes(compressedBiomes)
 
 	// Compress and write each subchunk
 	for _, sub := range data.SubChunks {
 		compressedSub := compress(sub, db.conf.Options.Compression)
-		binary.Write(buf, binary.LittleEndian, uint32(len(compressedSub)))
-		buf.Write(compressedSub)
+		appendBytes(compressedSub)
 	}
 
 	// Encode entities
 	entitiesData := db.encodeEntities(col.Entities)
-	binary.Write(buf, binary.LittleEndian, uint32(len(entitiesData)))
-	buf.Write(entitiesData)
+	appendBytes(entitiesData)
 
 	// Encode block entities
 	blockEntitiesData := db.encodeBlockEntities(col.BlockEntities)
-	binary.Write(buf, binary.LittleEndian, uint32(len(blockEntitiesData)))
-	buf.Write(blockEntitiesData)
+	appendBytes(blockEntitiesData)
 
 	// Encode scheduled updates
 	scheduledData := db.encodeScheduledUpdates(col.Tick, col.ScheduledBlocks)
-	binary.Write(buf, binary.LittleEndian, uint32(len(scheduledData)))
-	buf.Write(scheduledData)
+	appendBytes(scheduledData)
 
 	// Calculate and write size
-	result := buf.Bytes()
+	result := buf
 	binary.LittleEndian.PutUint32(result[sizePos:], uint32(len(result)))
 
 	// Calculate and write CRC32
@@ -491,19 +678,18 @@ func (db *DB) encodeColumn(pos world.ChunkPos, dim world.Dimension, col *chunk.C
 
 // decodeColumn decodes a compressed chunk column.
 func (db *DB) decodeColumn(data []byte, dim world.Dimension) (*chunk.Column, error) {
-	if len(data) < 4 || string(data[:4]) != "BLAZ" {
+	if len(data) < 26 || data[0] != 'B' || data[1] != 'L' || data[2] != 'A' || data[3] != 'Z' {
 		return nil, errors.New("invalid chunk header")
 	}
 
-	r := bytes.NewReader(data[4:])
-
 	// Read and verify size
-	var size uint32
-	binary.Read(r, binary.LittleEndian, &size)
+	size := binary.LittleEndian.Uint32(data[4:8])
+	if size > uint32(len(data)) {
+		return nil, errors.New("invalid chunk size")
+	}
 
 	// Read CRC32
-	var storedCRC uint32
-	binary.Read(r, binary.LittleEndian, &storedCRC)
+	storedCRC := binary.LittleEndian.Uint32(data[8:12])
 
 	// Verify checksum if enabled
 	if db.conf.Options.VerifyChecksums {
@@ -513,44 +699,48 @@ func (db *DB) decodeColumn(data []byte, dim world.Dimension) (*chunk.Column, err
 		}
 	}
 
-	// Read coordinates (for verification)
-	var x, z int32
-	binary.Read(r, binary.LittleEndian, &x)
-	binary.Read(r, binary.LittleEndian, &z)
+	off := 24 // magic + size + crc + x + z + dimension id
+	compression := CompressionType(data[off])
+	off++
+	subCount := int(data[off])
+	off++
 
-	// Read dimension ID
-	var dimID int32
-	binary.Read(r, binary.LittleEndian, &dimID)
-
-	// Read compression type
-	var compressionByte byte
-	binary.Read(r, binary.LittleEndian, &compressionByte)
-	compression := CompressionType(compressionByte)
-
-	// Read subchunk count
-	var subCount byte
-	binary.Read(r, binary.LittleEndian, &subCount)
+	readBytes := func() ([]byte, error) {
+		if len(data)-off < 4 {
+			return nil, errors.New("truncated chunk data")
+		}
+		n := int(binary.LittleEndian.Uint32(data[off:]))
+		off += 4
+		if n < 0 || n > len(data)-off {
+			return nil, errors.New("truncated chunk data")
+		}
+		v := data[off : off+n]
+		off += n
+		return v, nil
+	}
 
 	// Read and decompress biomes
-	var biomesLen uint32
-	binary.Read(r, binary.LittleEndian, &biomesLen)
-	compressedBiomes := make([]byte, biomesLen)
-	r.Read(compressedBiomes)
+	compressedBiomes, err := readBytes()
+	if err != nil {
+		return nil, err
+	}
 	biomes := decompress(compressedBiomes, compression)
 
 	// Read all compressed subchunk data FIRST (single sequential read)
 	compressedSubChunks := make([][]byte, subCount)
+	totalCompressedSubChunkBytes := 0
 	for i := range compressedSubChunks {
-		var subLen uint32
-		binary.Read(r, binary.LittleEndian, &subLen)
-		compressedSubChunks[i] = make([]byte, subLen)
-		r.Read(compressedSubChunks[i])
+		compressedSubChunks[i], err = readBytes()
+		if err != nil {
+			return nil, err
+		}
+		totalCompressedSubChunkBytes += len(compressedSubChunks[i])
 	}
 
 	// Decompress subchunks in PARALLEL
 	subChunks := make([][]byte, subCount)
-	if subCount >= 4 {
-		// Parallel decompression for chunks with 4+ subchunks
+	if db.conf.Options.ParallelCompression && subCount >= 8 && totalCompressedSubChunkBytes >= 512*1024 {
+		// Parallel decompression only pays off for unusually large chunk payloads.
 		var wg sync.WaitGroup
 		wg.Add(int(subCount))
 		for i := range compressedSubChunks {
@@ -580,29 +770,29 @@ func (db *DB) decodeColumn(data []byte, dim world.Dimension) (*chunk.Column, err
 	col := &chunk.Column{Chunk: c}
 
 	// Read entities
-	var entitiesLen uint32
-	binary.Read(r, binary.LittleEndian, &entitiesLen)
-	if entitiesLen > 0 {
-		entitiesData := make([]byte, entitiesLen)
-		r.Read(entitiesData)
+	entitiesData, err := readBytes()
+	if err != nil {
+		return nil, err
+	}
+	if len(entitiesData) > 0 {
 		col.Entities = db.decodeEntities(entitiesData)
 	}
 
 	// Read block entities
-	var blockEntitiesLen uint32
-	binary.Read(r, binary.LittleEndian, &blockEntitiesLen)
-	if blockEntitiesLen > 0 {
-		blockEntitiesData := make([]byte, blockEntitiesLen)
-		r.Read(blockEntitiesData)
+	blockEntitiesData, err := readBytes()
+	if err != nil {
+		return nil, err
+	}
+	if len(blockEntitiesData) > 0 {
 		col.BlockEntities = db.decodeBlockEntities(blockEntitiesData)
 	}
 
 	// Read scheduled updates
-	var scheduledLen uint32
-	binary.Read(r, binary.LittleEndian, &scheduledLen)
-	if scheduledLen > 0 {
-		scheduledData := make([]byte, scheduledLen)
-		r.Read(scheduledData)
+	scheduledData, err := readBytes()
+	if err != nil {
+		return nil, err
+	}
+	if len(scheduledData) > 0 {
 		col.ScheduledBlocks, col.Tick = db.decodeScheduledUpdates(scheduledData)
 	}
 
@@ -790,7 +980,68 @@ func (db *DB) Prefetcher() *Prefetcher {
 
 // Compact performs background compaction to optimize storage.
 func (db *DB) Compact() error {
-	db.conf.Options.Log.Debug("compaction triggered (no-op in MVP)")
+	db.flushWriteBuffer()
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	entries := db.index.snapshotSorted()
+	tmpPath := filepath.Join(db.dir, "chunks.dat.compact")
+	tmp, err := os.OpenFile(tmpPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
+	if err != nil {
+		return fmt.Errorf("compact: create temp data file: %w", err)
+	}
+
+	offset := int64(0)
+	compacted := make([]indexSnapshotEntry, 0, len(entries))
+	for _, snapshot := range entries {
+		if snapshot.entry.size <= 0 {
+			continue
+		}
+		reader := io.NewSectionReader(db.dataFd, snapshot.entry.offset, snapshot.entry.size)
+		if _, err := io.CopyN(tmp, reader, snapshot.entry.size); err != nil {
+			tmp.Close()
+			os.Remove(tmpPath)
+			return fmt.Errorf("compact: copy chunk: %w", err)
+		}
+		snapshot.entry.offset = offset
+		offset += snapshot.entry.size
+		compacted = append(compacted, snapshot)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("compact: close temp data file: %w", err)
+	}
+
+	currentPath := dataPath(db.dir)
+	backupPath := filepath.Join(db.dir, "chunks.dat.old")
+	if err := db.dataFd.Close(); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("compact: close current data file: %w", err)
+	}
+	if err := os.Remove(backupPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("compact: remove old backup: %w", err)
+	}
+	if err := os.Rename(currentPath, backupPath); err != nil {
+		return fmt.Errorf("compact: backup current data file: %w", err)
+	}
+	if err := os.Rename(tmpPath, currentPath); err != nil {
+		_ = os.Rename(backupPath, currentPath)
+		return fmt.Errorf("compact: replace data file: %w", err)
+	}
+
+	fd, err := os.OpenFile(currentPath, os.O_RDWR|os.O_CREATE, 0666)
+	if err != nil {
+		_ = os.Rename(backupPath, currentPath)
+		return fmt.Errorf("compact: reopen data file: %w", err)
+	}
+	db.dataFd = fd
+	db.fileOffset.Store(offset)
+	db.index.replace(compacted)
+	db.cache.clear()
+	if err := os.Remove(backupPath); err != nil && !os.IsNotExist(err) {
+		db.conf.Options.Log.Warn("compact: remove backup", "error", err)
+	}
 	return nil
 }
 

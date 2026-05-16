@@ -12,24 +12,25 @@ import (
 	"github.com/df-mc/dragonfly/server/world/mcdb"
 )
 
-func main() {
-	source := flag.String("source", "", "Source world folder path")
-	dest := flag.String("dest", "", "Destination world folder path")
-	from := flag.String("from", "", "Source format: 'leveldb' or 'blazedb'")
-	to := flag.String("to", "", "Destination format: 'leveldb' or 'blazedb'")
-	flag.Parse()
+func runConvert(args []string) {
+	fs := flag.NewFlagSet("convert", flag.ExitOnError)
+	source := fs.String("source", "", "Source world folder path")
+	dest := fs.String("dest", "", "Destination world folder path")
+	from := fs.String("from", "", "Source format: 'leveldb' or 'blazedb'")
+	to := fs.String("to", "", "Destination format: 'leveldb' or 'blazedb'")
+	_ = fs.Parse(args)
 
 	if *source == "" || *dest == "" || *from == "" || *to == "" {
 		fmt.Println("World Converter - Convert between LevelDB and BlazeDB formats")
 		fmt.Println()
 		fmt.Println("Usage:")
-		fmt.Println("  convert -source <path> -dest <path> -from <format> -to <format>")
+		fmt.Println("  go run ./cmd convert -source <path> -dest <path> -from <format> -to <format>")
 		fmt.Println()
 		fmt.Println("Formats: leveldb, blazedb")
 		fmt.Println()
 		fmt.Println("Examples:")
-		fmt.Println("  convert -source ./world_ldb -dest ./world_blaze -from leveldb -to blazedb")
-		fmt.Println("  convert -source ./world_blaze -dest ./world_ldb -from blazedb -to leveldb")
+		fmt.Println("  go run ./cmd convert -source ./world_ldb -dest ./world_blaze -from leveldb -to blazedb")
+		fmt.Println("  go run ./cmd convert -source ./world_blaze -dest ./world_ldb -from blazedb -to leveldb")
 		os.Exit(1)
 	}
 
@@ -61,7 +62,7 @@ func main() {
 	}
 
 	elapsed := time.Since(start)
-	fmt.Printf("\n✓ Conversion complete!\n")
+	fmt.Printf("\nConversion complete!\n")
 	fmt.Printf("  Total chunks: %d\n", totalChunks)
 	fmt.Printf("  Time: %v\n", elapsed.Round(time.Millisecond))
 	if elapsed.Seconds() > 0 {
@@ -96,19 +97,15 @@ func convertLevelDBToBlazeDB(srcPath, dstPath string, dim world.Dimension) int {
 	iter := srcDB.NewColumnIterator(nil)
 	for iter.Next() {
 		pos := iter.Position()
-
-		// Load column from source
-		col, err := srcDB.LoadColumn(pos, dim)
-		if err != nil {
-			continue
-		}
+		col := iter.Column()
+		chunkDim := iter.Dimension()
 
 		// Compact the chunk BEFORE storing to optimize palette storage
 		// This ensures optimal compression and native BlazeDB format
 		col.Chunk.Compact()
 
 		// Store to destination
-		if err := dstDB.StoreColumn(pos, dim, col); err != nil {
+		if err := dstDB.StoreColumn(pos, chunkDim, col); err != nil {
 			log.Printf("Warning: Failed to store chunk at %v: %v", pos, err)
 			continue
 		}
@@ -152,15 +149,11 @@ func convertBlazeDBToLevelDB(srcPath, dstPath string, dim world.Dimension) int {
 	iter := srcDB.NewColumnIterator(nil)
 	for iter.Next() {
 		pos := iter.Position()
-
-		// Load column from source
-		col, err := srcDB.LoadColumn(pos, dim)
-		if err != nil {
-			continue
-		}
+		col := iter.Column()
+		chunkDim := iter.Dimension()
 
 		// Store to destination
-		if err := dstDB.StoreColumn(pos, dim, col); err != nil {
+		if err := dstDB.StoreColumn(pos, chunkDim, col); err != nil {
 			log.Printf("Warning: Failed to store chunk at %v: %v", pos, err)
 			continue
 		}

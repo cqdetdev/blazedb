@@ -115,7 +115,7 @@ func SafeOptions() *Options {
 func TurboOptions() *Options {
 	return &Options{
 		CacheSize:           512 * 1024 * 1024, // 512MB cache
-		Compression:         CompressionSnappy, // No compression overhead
+		Compression:         CompressionNone,   // No compression overhead
 		VerifyChecksums:     false,
 		WriteBufferSize:     16 * 1024 * 1024, // 16MB buffer
 		FlushInterval:       5000,             // 5 second flush

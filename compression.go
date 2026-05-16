@@ -8,6 +8,8 @@ import (
 	"github.com/pierrec/lz4/v4"
 )
 
+const lz4RawBlockFlag = uint32(1 << 31)
+
 // Buffer pools for zero-allocation encoding/decoding
 var (
 	// Small buffer pool for chunks (64KB)
@@ -98,23 +100,24 @@ func compressLZ4(data []byte) []byte {
 	dst := make([]byte, 4+lz4.CompressBlockBound(len(data)))
 
 	// Store uncompressed size in first 4 bytes (little-endian)
-	dst[0] = byte(len(data))
-	dst[1] = byte(len(data) >> 8)
-	dst[2] = byte(len(data) >> 16)
-	dst[3] = byte(len(data) >> 24)
+	writeLZ4Size(dst, uint32(len(data)))
 
 	n, err := lz4.CompressBlock(data, dst[4:], nil)
 	if err != nil || n == 0 {
 		// Compression failed or data is incompressible, return original with size prefix
 		result := make([]byte, 4+len(data))
-		result[0] = byte(len(data))
-		result[1] = byte(len(data) >> 8)
-		result[2] = byte(len(data) >> 16)
-		result[3] = byte(len(data) >> 24)
+		writeLZ4Size(result, uint32(len(data))|lz4RawBlockFlag)
 		copy(result[4:], data)
 		return result
 	}
 	return dst[:4+n]
+}
+
+func writeLZ4Size(dst []byte, size uint32) {
+	dst[0] = byte(size)
+	dst[1] = byte(size >> 8)
+	dst[2] = byte(size >> 16)
+	dst[3] = byte(size >> 24)
 }
 
 // decompressLZ4 decompresses LZ4 data.
@@ -125,7 +128,16 @@ func decompressLZ4(data []byte) []byte {
 	}
 
 	// Read uncompressed size from first 4 bytes
-	uncompressedSize := int(data[0]) | int(data[1])<<8 | int(data[2])<<16 | int(data[3])<<24
+	sizeField := uint32(data[0]) | uint32(data[1])<<8 | uint32(data[2])<<16 | uint32(data[3])<<24
+	if sizeField&lz4RawBlockFlag != 0 {
+		uncompressedSize := int(sizeField &^ lz4RawBlockFlag)
+		if len(data)-4 == uncompressedSize {
+			return data[4:]
+		}
+		return data
+	}
+
+	uncompressedSize := int(sizeField)
 
 	if uncompressedSize <= 0 || uncompressedSize > 64*1024*1024 {
 		// Invalid size, return as-is
