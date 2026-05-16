@@ -5,7 +5,9 @@
 // specialized replacement for LevelDB/mcdb for chunk-heavy Bedrock workloads.
 // It uses append-only chunk records, a persisted Morton/Z-order spatial index,
 // an in-memory sharded LRU chunk cache, optional compression, and open-time
-// index recovery from chunks.dat.
+// index recovery from chunks.dat. Workload-oriented opt-in APIs include
+// overlay providers for disposable maps, explicit block-delta records, pinned
+// cache areas, and segmented providers for region-level deletion/compaction.
 //
 // Current local benchmarks use the committed Dragonfly chunk suite in
 // tests/benchmark_test.go on Windows/amd64 with an AMD Ryzen 7 7730U and Go
@@ -21,6 +23,8 @@
 //   - Generated dense chunk reopened load: 84.0 us/op vs LevelDB 1.48 ms/op (~18x faster).
 //   - Sparse repeated area misses: about 11.1 us/op after negative-miss caching,
 //     compared with about 190 us/op cold.
+//   - Explicit one-block delta records: about 14-19 us/op with one
+//     allocation in tests/provider_workflow_benchmark_test.go.
 //
 // Durability is configurable. DurabilityFast is the default high-throughput
 // mode and does not fsync on the StoreColumn hot path. DurabilityBalanced keeps
@@ -36,5 +40,7 @@
 //
 // Benchmark numbers are workload- and machine-dependent. The committed suite
 // uses synthetic and generated dense Dragonfly chunk columns, not a bundled
-// real-world world corpus.
+// real-world world corpus. The optional overlay, delta, pinning, and segmented
+// APIs are additive; the default StoreColumn/LoadColumn path does not enable
+// delta records unless Options.EnableDeltaRecords is set.
 package blazedb

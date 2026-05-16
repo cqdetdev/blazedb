@@ -7,6 +7,7 @@ It is engineered to overcome specific bottlenecks found in general-purpose KV st
 ## Features
 
 - **Unchanged Save Elision**: Repeated saves of byte-identical hot chunks skip disk append and fsync after an exact encoded-record comparison.
+- **Workload APIs**: Overlay providers, explicit block-delta records, pinned hot-area caches, and optional segmented providers for reset-heavy or mutation-heavy workloads.
 - 🚀 **High Performance**: Optimized specifically for chunk data (reads/writes).
 - 🗺️ **Spatial Locality**: Uses Z-Order (Morton) curves to keep creating/loading nearby chunks physically close on disk, effectively acting as a hardware-level prefetch.
 - 💾 **Append-Only Storage**: Writes are always appended to the end of the file, eliminating random write seeks and "compaction stalls" during gameplay.
@@ -39,8 +40,9 @@ encoded record for that chunk. If the bytes are identical, BlazeDB returns
 without appending another record or syncing the data file.
 
 Disk files:
-|-- chunks.dat  append-only chunk data
-`-- index.dat   persisted spatial index
+|-- chunks.dat  append-only full chunk data
+|-- index.dat   persisted spatial index
+`-- deltas.dat  optional explicit block-delta records
 ```
 
 ### 1. Z-Order Spatial Indexing
@@ -106,6 +108,14 @@ BlazeDB also caches negative area misses. In sparse repeated area scans, the ben
 
 For repeated same-position saves of unchanged chunks, BlazeDB keeps the last encoded hot record in the chunk cache and performs an exact byte comparison before committing a new record. In the targeted benchmark, `DurabilitySafe` unchanged saves dropped from about `548 us/op` before this optimization to about `5.47 us/op`, while `DurabilitySafeBatch` unchanged saves measured about `6.75 us/op`. Dense unchanged safe saves still pay Dragonfly encode cost and measured about `31.2 us/op`, but skip the expensive append/fsync step.
 
+Provider workflow benchmarks from `tests/provider_workflow_benchmark_test.go`:
+
+| Workload | Cost | Alloc/op | Notes |
+| :--- | ---: | ---: | :--- |
+| Explicit one-block delta record | ~14-19 us/op | ~166-183 B | Avoids full chunk-column encoding for event-layer block edits. |
+| Overlay edit/reset mix | ~398-456 us/op | ~62 KB | Writes arena mutations to a disposable overlay and periodically resets it. |
+| Segmented provider store | ~42-51 us/op | ~4.7-5.3 KB | Routes chunks into per-region DBs for independent deletion/compaction. |
+
 Cache-size tuning benchmarks showed that `128MB` is the smallest tested cache setting that keeps a generated dense radius-32 working set hot after warm-up. In that benchmark, `64MB` was enough for radius-16, while radius-32 needed `128MB` to reach 100% cache hits and roughly 150 ns/op cached loads. Larger caches are still useful for multiple players in different areas.
 
 Safety mode store costs from the same benchmark run:
@@ -152,6 +162,8 @@ db, err := blazedb.Config{Options: opts}.Open("world_blazedb")
 BlazeDB treats `index.dat` as a persisted acceleration index. If it is missing, corrupted, or stale compared with `chunks.dat`, BlazeDB rebuilds it on open by scanning valid records in `chunks.dat`, then saves the rebuilt index atomically. During rebuild, incomplete tail records from interrupted appends are truncated, complete records with bad CRCs are skipped, and older valid chunk versions remain usable.
 
 Old chunk versions are removed only when `Compact()` is called.
+
+Delta records are optional and are only used when `Options.EnableDeltaRecords` is true and callers use `StoreBlockDeltas`. A later full `StoreColumn` snapshots the chunk and supersedes older deltas. `Compact()` folds active deltas back into full chunk records and truncates `deltas.dat`.
 
 ### Pros of BlazeDB
 1.  **No Write Stalls**: Since it just appends to a file, you don't get the "hiccups" caused by LevelDB compacting generic string keys in the background.
@@ -200,6 +212,91 @@ func main() {
 ```
 
 
+## High-Churn and Ephemeral Worlds
+
+For long-running worlds, disposable arenas, minigames, and generated maps, BlazeDB exposes opt-in APIs that keep the default provider fast while allowing server-specific storage strategies.
+
+### Presets
+
+```go
+active := blazedb.ActiveWorldOptions()       // good starting point for factions/warzones
+ephemeral := blazedb.EphemeralWorldOptions() // good starting point for practice/duel overlays
+```
+
+### Read-only template plus disposable overlay
+
+Use an overlay provider for temporary maps. The base provider is the clean template; the overlay receives all session mutations. Resetting the map discards the overlay instead of copying the whole map. This fits practice and duel arenas well, but the API itself is generic.
+
+```go
+template, err := blazedb.Open("templates/nodebuff")
+if err != nil {
+    panic(err)
+}
+
+arena, err := blazedb.OpenOverlayProvider(template, "arenas/match-123", blazedb.EphemeralWorldOptions(), nil)
+if err != nil {
+    panic(err)
+}
+
+// Use arena as the Dragonfly world provider.
+// After the match:
+_ = arena.ResetOverlay()
+```
+
+Overlay fallback clones template chunks by default, so mutating a loaded arena chunk does not mutate the shared template cache.
+
+### Explicit block-delta records
+
+When the server event layer knows exactly which blocks changed, call `StoreBlockDeltas` instead of saving a full chunk column for every small edit:
+
+```go
+opts := blazedb.ActiveWorldOptions()
+db, err := blazedb.Config{Options: opts}.Open("world_blazedb")
+if err != nil {
+    panic(err)
+}
+
+err = db.StoreBlockDeltas(chunkPos, world.Overworld, []blazedb.BlockDelta{{
+    Pos:       blockPos, // absolute block position is fine
+    Layer:     0,
+    RuntimeID: runtimeID,
+}})
+```
+
+Delta records are not automatic dirty tracking. Dragonfly still calls `StoreColumn` for normal provider saves. Use deltas from block-place/break/explosion handlers when your server already has exact mutation events.
+
+### Pinned hot areas
+
+Pin known hot arenas or spawn/warzone areas so cache auto-tuning and LRU eviction do not push them out:
+
+```go
+pinned, err := db.PinArea(world.ChunkPos{0, 0}, 8, world.Overworld)
+_ = pinned
+_ = err
+defer db.UnpinArea(world.ChunkPos{0, 0}, 8, world.Overworld)
+```
+
+Pinned entries may let the cache exceed its configured limit if you pin more chunks than the cache can hold, so pin deliberately.
+
+### Optional segmented provider
+
+Use segmentation when you want independent per-region storage files, for example deleting a finished arena shard or compacting a hot factions region without touching the full world:
+
+```go
+provider, err := blazedb.OpenSegmentedProvider("world_segmented", &blazedb.SegmentOptions{
+    SegmentSize: 32,
+    Options:     blazedb.ActiveWorldOptions(),
+})
+if err != nil {
+    panic(err)
+}
+
+// Delete the segment containing a disposable arena.
+_ = provider.DeleteSegmentFor(world.ChunkPos{128, 0}, world.Overworld)
+```
+
+Segmentation adds routing/open-file overhead, so use it for reset/operations benefits rather than for the fastest single-chunk store path.
+
 ## Predictive Prefetching
 
 BlazeDB includes a smart, threaded prefetcher that analyzes player movement to predict and load future chunks before they are requested.
@@ -246,11 +343,22 @@ if err := iter.Error(); err != nil {
 | `FlushInterval` | `1000ms` | Simple periodic background flushes. |
 | `VerifyChecksums` | `false` | Verify CRC32 checksums on read (costs CPU). |
 | `Durability` | `DurabilityFast` | Fsync/buffering policy (`Fast`, `Balanced`, `Safe`, `SafeBatch`). |
+| `EnableDeltaRecords` | `false` | Enables the explicit `StoreBlockDeltas` API and `deltas.dat`. |
 | `Log` | `slog.Default()` | Logger for debug/error messages. |
 
 `TurboOptions()` uses a `512MB` cache, `CompressionNone`, a `16MB` write buffer, and a `5000ms` flush interval for maximum write throughput when crash-window tradeoffs are acceptable.
 
 `BalancedOptions()` enables `DurabilityBalanced`, checksum verification, Snappy compression, and smaller flush batches. `SafeOptions()` enables `DurabilitySafe`, checksum verification, immediate writes, and no background write buffer. `SafeBatchOptions()` enables `DurabilitySafeBatch` for synced batch commits across concurrent callers.
+
+`ActiveWorldOptions()` starts from `BalancedOptions()`, uses a `256MB` cache, and enables explicit delta records. Use it as a starting point for factions, warzones, and other long-running mutation-heavy worlds. `EphemeralWorldOptions()` starts from `TurboOptions()`, uses a smaller `64MB` cache, and enables explicit delta records for disposable overlays, duel arenas, minigame rounds, or generated temporary worlds.
+
+## API Ideas Still Worth Exploring
+
+- Dirty-chunk adapters for Dragonfly handlers so clean chunks never reach `StoreColumn`.
+- Arena lease management around `OverlayProvider`, including automatic cleanup of old overlay directories.
+- Region-level compaction scheduling for `SegmentedProvider`.
+- Metrics hooks for overlay hit rate, delta record count, pinned cache size, and per-segment write pressure.
+- Optional "snapshot overlay into base" tooling for promoting an edited arena template.
 
 ### Credits
 - Antigravity and Claude Code

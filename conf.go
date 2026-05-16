@@ -71,6 +71,10 @@ type Options struct {
 	// Defaults to true.
 	AutoTuneCache bool
 
+	// EnableDeltaRecords enables the explicit StoreBlockDeltas API. It is off
+	// by default so the standard StoreColumn hot path remains unchanged.
+	EnableDeltaRecords bool
+
 	// AutoTuneInterval is how often to check cache hit rate (in seconds).
 	// Defaults to 30 seconds.
 	AutoTuneInterval int
@@ -229,4 +233,9 @@ func indexPath(dir string) string {
 // metadataPath returns the path to the metadata file.
 func metadataPath(dir string) string {
 	return filepath.Join(dir, "metadata.json")
+}
+
+// deltaPath returns the path to the optional block delta log.
+func deltaPath(dir string) string {
+	return filepath.Join(dir, "deltas.dat")
 }

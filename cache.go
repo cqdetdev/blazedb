@@ -39,6 +39,7 @@ type cacheEntry struct {
 	col    *chunk.Column
 	record []byte
 	size   int64
+	pinned bool
 }
 
 // newChunkCache creates a new chunk cache with the given max size in bytes.
@@ -127,32 +128,14 @@ func (c *chunkCache) put(key chunkKey, col *chunk.Column) {
 		entry.col = col
 		entry.size = size
 		shard.lru.MoveToFront(elem)
-		for shard.size.Load() > shard.maxSize && shard.lru.Len() > 0 {
-			oldest := shard.lru.Back()
-			if oldest == nil || oldest == elem {
-				break
-			}
-			oldEntry := oldest.Value.(*cacheEntry)
-			shard.size.Add(-oldEntry.size)
-			delete(shard.entries, oldEntry.key)
-			shard.lru.Remove(oldest)
-		}
+		shard.evictUntilLocked(0, elem)
 		return
 	}
 
 	size := estimateCacheEntrySize(col, nil)
 
 	// Evict if needed - O(1) eviction from back
-	for shard.size.Load()+size > shard.maxSize && shard.lru.Len() > 0 {
-		oldest := shard.lru.Back()
-		if oldest == nil {
-			break
-		}
-		oldEntry := oldest.Value.(*cacheEntry)
-		shard.size.Add(-oldEntry.size)
-		delete(shard.entries, oldEntry.key)
-		shard.lru.Remove(oldest)
-	}
+	shard.evictUntilLocked(size, nil)
 
 	// Add new entry
 	entry := &cacheEntry{
@@ -189,32 +172,14 @@ func (c *chunkCache) putCleanWithRecord(key chunkKey, col *chunk.Column, record 
 		entry.col = col
 		entry.size = size
 		shard.lru.MoveToFront(elem)
-		for shard.size.Load() > shard.maxSize && shard.lru.Len() > 0 {
-			oldest := shard.lru.Back()
-			if oldest == nil || oldest == elem {
-				break
-			}
-			oldEntry := oldest.Value.(*cacheEntry)
-			shard.size.Add(-oldEntry.size)
-			delete(shard.entries, oldEntry.key)
-			shard.lru.Remove(oldest)
-		}
+		shard.evictUntilLocked(0, elem)
 		return
 	}
 
 	size := estimateCacheEntrySize(col, record)
 
 	// Evict if needed
-	for shard.size.Load()+size > shard.maxSize && shard.lru.Len() > 0 {
-		oldest := shard.lru.Back()
-		if oldest == nil {
-			break
-		}
-		oldEntry := oldest.Value.(*cacheEntry)
-		shard.size.Add(-oldEntry.size)
-		delete(shard.entries, oldEntry.key)
-		shard.lru.Remove(oldest)
-	}
+	shard.evictUntilLocked(size, nil)
 
 	entry := &cacheEntry{
 		key:    key,
@@ -260,16 +225,73 @@ func (c *chunkCache) putRecord(key chunkKey, record []byte) {
 	shard.size.Add(delta)
 	shard.lru.MoveToFront(elem)
 
-	for shard.size.Load() > shard.maxSize && shard.lru.Len() > 0 {
-		oldest := shard.lru.Back()
-		if oldest == nil || oldest == elem {
-			break
+	shard.evictUntilLocked(0, elem)
+}
+
+func (s *cacheShard) evictUntilLocked(extra int64, protect *list.Element) {
+	for s.size.Load()+extra > s.maxSize && s.lru.Len() > 0 {
+		var victim *list.Element
+		for elem, scanned := s.lru.Back(), 0; elem != nil && scanned < s.lru.Len(); scanned++ {
+			entry := elem.Value.(*cacheEntry)
+			if elem != protect && !entry.pinned {
+				victim = elem
+				break
+			}
+			elem = elem.Prev()
 		}
-		oldEntry := oldest.Value.(*cacheEntry)
-		shard.size.Add(-oldEntry.size)
-		delete(shard.entries, oldEntry.key)
-		shard.lru.Remove(oldest)
+		if victim == nil {
+			return
+		}
+		entry := victim.Value.(*cacheEntry)
+		s.size.Add(-entry.size)
+		delete(s.entries, entry.key)
+		s.lru.Remove(victim)
 	}
+}
+
+func (c *chunkCache) pin(key chunkKey) bool {
+	shard := c.shard(key)
+
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	elem, ok := shard.entries[key]
+	if !ok {
+		return false
+	}
+	entry := elem.Value.(*cacheEntry)
+	entry.pinned = true
+	shard.lru.MoveToFront(elem)
+	return true
+}
+
+func (c *chunkCache) unpin(key chunkKey) bool {
+	shard := c.shard(key)
+
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	elem, ok := shard.entries[key]
+	if !ok {
+		return false
+	}
+	elem.Value.(*cacheEntry).pinned = false
+	shard.evictUntilLocked(0, nil)
+	return true
+}
+
+func (c *chunkCache) pinnedCount() int {
+	var total int
+	for _, shard := range c.shards {
+		shard.mu.RLock()
+		for _, elem := range shard.entries {
+			if elem.Value.(*cacheEntry).pinned {
+				total++
+			}
+		}
+		shard.mu.RUnlock()
+	}
+	return total
 }
 
 // currentSize returns the current estimated size of the cache.
@@ -357,16 +379,7 @@ func (c *chunkCache) resize(newMaxSize int64) {
 		shard.mu.Lock()
 		shard.maxSize = newShardSize
 		// Evict excess if shrinking
-		for shard.size.Load() > newShardSize && shard.lru.Len() > 0 {
-			oldest := shard.lru.Back()
-			if oldest == nil {
-				break
-			}
-			oldEntry := oldest.Value.(*cacheEntry)
-			shard.size.Add(-oldEntry.size)
-			delete(shard.entries, oldEntry.key)
-			shard.lru.Remove(oldest)
-		}
+		shard.evictUntilLocked(0, nil)
 		shard.mu.Unlock()
 	}
 }

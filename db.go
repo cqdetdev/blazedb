@@ -31,18 +31,21 @@ var ErrNotFound = leveldb.ErrNotFound
 // optimized for Minecraft Bedrock worlds using Z-order spatial indexing
 // and Minecraft-specific compression.
 type DB struct {
-	conf   Config
-	dir    string
-	ldat   *leveldat.Data
-	set    *world.Settings
-	cache  *chunkCache
-	misses *negativeCache
-	index  *spatialIndex
-	dataFd *os.File
-	mu     sync.RWMutex
+	conf    Config
+	dir     string
+	ldat    *leveldat.Data
+	set     *world.Settings
+	cache   *chunkCache
+	misses  *negativeCache
+	index   *spatialIndex
+	dataFd  *os.File
+	delta   *deltaIndex
+	deltaFd *os.File
+	mu      sync.RWMutex
 
 	// Atomic offset tracking - avoids Stat() syscall on every write
-	fileOffset atomic.Int64
+	fileOffset  atomic.Int64
+	deltaOffset atomic.Int64
 
 	// Write buffer for batched writes - stores raw columns for lazy encoding
 	writeBuf     map[chunkKey]*chunk.Column
@@ -61,7 +64,8 @@ type DB struct {
 	// Predictive prefetcher for chunk loading
 	prefetcher *Prefetcher
 
-	writeSkips atomic.Int64
+	writeSkips   atomic.Int64
+	deltaRecords atomic.Int64
 
 	// Player spawn positions (stored in-memory, persisted on close)
 	playerSpawns   map[uuid.UUID]cube.Pos
@@ -150,6 +154,23 @@ func newDB(conf Config, dir string) (*DB, error) {
 	// Initialize atomic file offset from current file size (avoids Stat() on every write)
 	if stat, err := db.dataFd.Stat(); err == nil {
 		db.fileOffset.Store(stat.Size())
+	}
+
+	if conf.Options.EnableDeltaRecords {
+		db.delta = newDeltaIndex()
+		db.deltaFd, err = os.OpenFile(deltaPath(dir), os.O_RDWR|os.O_CREATE, 0666)
+		if err != nil {
+			_ = db.dataFd.Close()
+			return nil, fmt.Errorf("open db: open deltas.dat: %w", err)
+		}
+		if stat, err := db.deltaFd.Stat(); err == nil {
+			db.deltaOffset.Store(stat.Size())
+		}
+		if err := db.rebuildDeltaIndex(); err != nil {
+			_ = db.deltaFd.Close()
+			_ = db.dataFd.Close()
+			return nil, fmt.Errorf("open db: rebuild delta index: %w", err)
+		}
 	}
 
 	// Load or rebuild the index. Rebuilds only happen on open when index.dat
@@ -348,6 +369,7 @@ func (db *DB) flushWriteBuffer() error {
 	db.index.putBatch(updates)
 	for _, write := range writes {
 		if !write.skipped {
+			db.clearDeltasForFullWrite(write.key)
 			db.cache.putRecord(write.key, write.data)
 		}
 	}
@@ -580,6 +602,9 @@ func (db *DB) loadColumnAfterCacheMiss(key chunkKey, dim world.Dimension) (*chun
 	if err != nil {
 		return nil, fmt.Errorf("decode column: %w", err)
 	}
+	if err := db.applyIndexedDeltas(key, offset, col); err != nil {
+		return nil, err
+	}
 
 	// Add to cache with the exact encoded record so unchanged future saves can
 	// skip append/fsync after byte-for-byte comparison.
@@ -639,6 +664,7 @@ func (db *DB) StoreColumn(pos world.ChunkPos, dim world.Dimension, col *chunk.Co
 	if err := db.syncDataFile("store chunk"); err != nil {
 		return err
 	}
+	db.clearDeltasForFullWrite(key)
 	db.cache.putRecord(key, data)
 
 	return nil
@@ -1220,12 +1246,59 @@ func (db *DB) NewColumnIterator(r *IteratorRange) *ColumnIterator {
 func (db *DB) GetStats() *Stats {
 	stats := db.cache.stats()
 	stats.ChunkWriteSkips = db.writeSkips.Load()
+	stats.PinnedChunks = int64(db.cache.pinnedCount())
+	stats.DeltaRecords = db.deltaRecords.Load()
 	return stats
 }
 
 // Prefetcher returns the prefetcher for registering player positions.
 func (db *DB) Prefetcher() *Prefetcher {
 	return db.prefetcher
+}
+
+// PinColumn loads a column into the cache and prevents it from being evicted
+// until UnpinColumn is called. This is useful for fixed arenas, spawns, KOTH
+// regions, and other hot areas known ahead of time.
+func (db *DB) PinColumn(pos world.ChunkPos, dim world.Dimension) error {
+	key := newChunkKey(pos, dim)
+	if _, err := db.LoadColumn(pos, dim); err != nil {
+		return err
+	}
+	db.cache.pin(key)
+	return nil
+}
+
+// UnpinColumn allows a previously pinned column to be evicted again.
+func (db *DB) UnpinColumn(pos world.ChunkPos, dim world.Dimension) {
+	db.cache.unpin(newChunkKey(pos, dim))
+}
+
+// PinArea pins all existing columns inside radius around center. Missing
+// columns are skipped and non-not-found errors stop the operation.
+func (db *DB) PinArea(center world.ChunkPos, radius int, dim world.Dimension) (int, error) {
+	pinned := 0
+	for dx := -radius; dx <= radius; dx++ {
+		for dz := -radius; dz <= radius; dz++ {
+			pos := world.ChunkPos{center[0] + int32(dx), center[1] + int32(dz)}
+			if err := db.PinColumn(pos, dim); err != nil {
+				if errors.Is(err, ErrNotFound) {
+					continue
+				}
+				return pinned, err
+			}
+			pinned++
+		}
+	}
+	return pinned, nil
+}
+
+// UnpinArea allows all columns inside radius around center to be evicted again.
+func (db *DB) UnpinArea(center world.ChunkPos, radius int, dim world.Dimension) {
+	for dx := -radius; dx <= radius; dx++ {
+		for dz := -radius; dz <= radius; dz++ {
+			db.UnpinColumn(world.ChunkPos{center[0] + int32(dx), center[1] + int32(dz)}, dim)
+		}
+	}
 }
 
 // Compact performs background compaction to optimize storage.
@@ -1250,14 +1323,64 @@ func (db *DB) Compact() error {
 		if snapshot.entry.size <= 0 {
 			continue
 		}
-		reader := io.NewSectionReader(db.dataFd, snapshot.entry.offset, snapshot.entry.size)
-		if _, err := io.CopyN(tmp, reader, snapshot.entry.size); err != nil {
-			tmp.Close()
-			os.Remove(tmpPath)
-			return fmt.Errorf("compact: copy chunk: %w", err)
+		key := chunkKey{dimID: snapshot.key.dim}
+		key.x, key.z = mortonDecode(snapshot.key.morton)
+
+		size := snapshot.entry.size
+		if db.delta != nil {
+			if deltas := db.delta.getForBase(key, snapshot.entry.offset); len(deltas) > 0 {
+				dim, ok := world.DimensionByID(int(key.dimID))
+				if !ok {
+					continue
+				}
+				record := make([]byte, snapshot.entry.size)
+				if _, err := db.dataFd.ReadAt(record, snapshot.entry.offset); err != nil {
+					tmp.Close()
+					os.Remove(tmpPath)
+					return fmt.Errorf("compact: read chunk with deltas: %w", err)
+				}
+				col, err := db.decodeColumn(record, dim)
+				if err != nil {
+					tmp.Close()
+					os.Remove(tmpPath)
+					return fmt.Errorf("compact: decode chunk with deltas: %w", err)
+				}
+				if err := db.applyIndexedDeltas(key, snapshot.entry.offset, col); err != nil {
+					tmp.Close()
+					os.Remove(tmpPath)
+					return fmt.Errorf("compact: apply deltas: %w", err)
+				}
+				record, err = db.encodeColumnForKey(key, col)
+				if err != nil {
+					tmp.Close()
+					os.Remove(tmpPath)
+					return fmt.Errorf("compact: encode chunk with deltas: %w", err)
+				}
+				if _, err := tmp.Write(record); err != nil {
+					tmp.Close()
+					os.Remove(tmpPath)
+					return fmt.Errorf("compact: write chunk with deltas: %w", err)
+				}
+				size = int64(len(record))
+				snapshot.entry.size = size
+			} else {
+				reader := io.NewSectionReader(db.dataFd, snapshot.entry.offset, snapshot.entry.size)
+				if _, err := io.CopyN(tmp, reader, snapshot.entry.size); err != nil {
+					tmp.Close()
+					os.Remove(tmpPath)
+					return fmt.Errorf("compact: copy chunk: %w", err)
+				}
+			}
+		} else {
+			reader := io.NewSectionReader(db.dataFd, snapshot.entry.offset, snapshot.entry.size)
+			if _, err := io.CopyN(tmp, reader, snapshot.entry.size); err != nil {
+				tmp.Close()
+				os.Remove(tmpPath)
+				return fmt.Errorf("compact: copy chunk: %w", err)
+			}
 		}
 		snapshot.entry.offset = offset
-		offset += snapshot.entry.size
+		offset += size
 		compacted = append(compacted, snapshot)
 	}
 	if err := tmp.Close(); err != nil {
@@ -1291,6 +1414,18 @@ func (db *DB) Compact() error {
 	db.fileOffset.Store(offset)
 	db.index.replace(compacted)
 	db.cache.clear()
+	if db.delta != nil && db.deltaFd != nil {
+		if err := db.truncateDeltaFile(0); err != nil {
+			return err
+		}
+		if db.conf.Options.Durability >= DurabilityBalanced {
+			if err := db.deltaFd.Sync(); err != nil {
+				return fmt.Errorf("compact: sync truncated deltas.dat: %w", err)
+			}
+		}
+		db.delta = newDeltaIndex()
+		db.deltaRecords.Store(0)
+	}
 	if err := db.syncDataFile("compact"); err != nil {
 		return err
 	}
@@ -1358,6 +1493,17 @@ func (db *DB) Close() error {
 		return fmt.Errorf("close: save metadata: %w", err)
 	}
 
+	if db.deltaFd != nil {
+		if db.conf.Options.Durability >= DurabilityBalanced {
+			if err := db.deltaFd.Sync(); err != nil {
+				return fmt.Errorf("close: sync deltas.dat: %w", err)
+			}
+		}
+		if err := db.deltaFd.Close(); err != nil {
+			return fmt.Errorf("close: close deltas.dat: %w", err)
+		}
+	}
+
 	// Close data file
 	if err := db.dataFd.Close(); err != nil {
 		return fmt.Errorf("close: close data file: %w", err)
@@ -1394,6 +1540,8 @@ type Stats struct {
 	ChunkWriteSkips int64
 	CacheHits       int64
 	CacheMisses     int64
+	PinnedChunks    int64
+	DeltaRecords    int64
 	CompressionTime time.Duration
 }
 
