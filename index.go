@@ -3,7 +3,9 @@ package blazedb
 import (
 	"bufio"
 	"encoding/binary"
+	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 
@@ -13,8 +15,9 @@ import (
 // spatialIndex provides fast lookups of chunk positions to file offsets
 // using Z-order (Morton) curve encoding for spatial locality.
 type spatialIndex struct {
-	mu      sync.RWMutex
-	entries map[indexKey]indexEntry
+	mu            sync.RWMutex
+	entries       map[indexKey]indexEntry
+	savedDataSize int64
 }
 
 type indexKey struct {
@@ -43,7 +46,8 @@ type indexSnapshotEntry struct {
 // newSpatialIndex creates a new spatial index.
 func newSpatialIndex() *spatialIndex {
 	return &spatialIndex{
-		entries: make(map[indexKey]indexEntry),
+		entries:       make(map[indexKey]indexEntry),
+		savedDataSize: -1,
 	}
 }
 
@@ -167,22 +171,34 @@ func (idx *spatialIndex) delete(key chunkKey) {
 
 // save persists the index to a file.
 func (idx *spatialIndex) save(path string) error {
+	return idx.saveWithDataSize(path, -1, false)
+}
+
+func (idx *spatialIndex) saveWithDataSize(path string, dataSize int64, syncFile bool) error {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
-	f, err := os.Create(path)
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-")
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	tmpPath := tmp.Name()
+	removeTmp := true
+	defer func() {
+		if removeTmp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
 
-	w := bufio.NewWriterSize(f, 256*1024)
+	w := bufio.NewWriterSize(tmp, 256*1024)
 
 	// Write header: magic + count
 	header := make([]byte, 12)
 	copy(header[:4], "BIDX")
 	binary.LittleEndian.PutUint64(header[4:], uint64(len(idx.entries)))
 	if _, err := w.Write(header); err != nil {
+		_ = tmp.Close()
 		return err
 	}
 
@@ -194,11 +210,63 @@ func (idx *spatialIndex) save(path string) error {
 		binary.LittleEndian.PutUint64(entry[16:], uint64(e.size))
 		binary.LittleEndian.PutUint32(entry[24:], uint32(e.dim))
 		if _, err := w.Write(entry); err != nil {
+			_ = tmp.Close()
 			return err
 		}
 	}
 
-	return w.Flush()
+	if dataSize >= 0 {
+		footer := make([]byte, 12)
+		copy(footer[:4], "BDAT")
+		binary.LittleEndian.PutUint64(footer[4:], uint64(dataSize))
+		if _, err := w.Write(footer); err != nil {
+			_ = tmp.Close()
+			return err
+		}
+	}
+
+	if err := w.Flush(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if syncFile {
+		if err := tmp.Sync(); err != nil {
+			_ = tmp.Close()
+			return err
+		}
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := replaceFile(tmpPath, path); err != nil {
+		return err
+	}
+	removeTmp = false
+	return nil
+}
+
+func replaceFile(tmpPath, path string) error {
+	backupPath := path + ".old"
+	_ = os.Remove(backupPath)
+
+	targetExists := fileExists(path)
+	if targetExists {
+		if err := os.Rename(path, backupPath); err != nil {
+			return err
+		}
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		if targetExists {
+			_ = os.Rename(backupPath, path)
+		}
+		return err
+	}
+	if targetExists {
+		if err := os.Remove(backupPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove old index backup: %w", err)
+		}
+	}
+	return nil
 }
 
 // load reads the index from a file.
@@ -216,12 +284,13 @@ func (idx *spatialIndex) load(path string) error {
 	}
 
 	count := binary.LittleEndian.Uint64(data[4:12])
-	expectedLen := 12 + count*28
-	if uint64(len(data)) < expectedLen {
+	if count > (uint64(len(data))-12)/28 {
 		return os.ErrInvalid
 	}
+	expectedLen := 12 + count*28
 
 	idx.entries = make(map[indexKey]indexEntry, count)
+	idx.savedDataSize = -1
 
 	for i := uint64(0); i < count; i++ {
 		off := 12 + i*28
@@ -229,12 +298,19 @@ func (idx *spatialIndex) load(path string) error {
 		offset := int64(binary.LittleEndian.Uint64(data[off+8:]))
 		size := int64(binary.LittleEndian.Uint64(data[off+16:]))
 		dim := int32(binary.LittleEndian.Uint32(data[off+24:]))
+		if offset < 0 || size <= 0 {
+			return os.ErrInvalid
+		}
 
 		idx.entries[indexKey{morton: morton, dim: dim}] = indexEntry{
 			offset: offset,
 			size:   size,
 			dim:    dim,
 		}
+	}
+	footerOffset := int(expectedLen)
+	if len(data)-footerOffset >= 12 && string(data[footerOffset:footerOffset+4]) == "BDAT" {
+		idx.savedDataSize = int64(binary.LittleEndian.Uint64(data[footerOffset+4:]))
 	}
 
 	return nil
@@ -245,6 +321,27 @@ func (idx *spatialIndex) count() int {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 	return len(idx.entries)
+}
+
+func (idx *spatialIndex) needsRebuild(dataSize int64) bool {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+
+	if idx.savedDataSize >= 0 {
+		return idx.savedDataSize != dataSize
+	}
+	return idx.maxEndLocked() != dataSize
+}
+
+func (idx *spatialIndex) maxEndLocked() int64 {
+	var maxEnd int64
+	for _, entry := range idx.entries {
+		end := entry.offset + entry.size
+		if end > maxEnd {
+			maxEnd = end
+		}
+	}
+	return maxEnd
 }
 
 func (idx *spatialIndex) snapshotSorted() []indexSnapshotEntry {

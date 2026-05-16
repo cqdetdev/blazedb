@@ -182,6 +182,44 @@ func BenchmarkBlazeDBStoreNoCompression(b *testing.B) {
 	}
 }
 
+func BenchmarkBlazeDBStoreBalanced(b *testing.B) {
+	dir := b.TempDir()
+	opts := blazedb.BalancedOptions()
+	opts.Log = discardLogger()
+	db, err := blazedb.Config{Options: opts}.Open(dir)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+
+	col := createTestColumn(world.Overworld.Range())
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		pos := world.ChunkPos{int32(i % 1000), int32(i / 1000)}
+		_ = db.StoreColumn(pos, world.Overworld, col)
+	}
+}
+
+func BenchmarkBlazeDBStoreSafe(b *testing.B) {
+	dir := b.TempDir()
+	opts := blazedb.SafeOptions()
+	opts.Log = discardLogger()
+	db, err := blazedb.Config{Options: opts}.Open(dir)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+
+	col := createTestColumn(world.Overworld.Range())
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		pos := world.ChunkPos{int32(i % 1000), int32(i / 1000)}
+		_ = db.StoreColumn(pos, world.Overworld, col)
+	}
+}
+
 // BenchmarkLevelDBLoad benchmarks chunk loading from LevelDB.
 func BenchmarkLevelDBLoad(b *testing.B) {
 	dir := b.TempDir()

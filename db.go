@@ -85,6 +85,11 @@ type pendingEncode struct {
 	col     *chunk.Column
 }
 
+const (
+	chunkRecordHeaderSize = 26
+	maxChunkRecordSize    = 256 * 1024 * 1024
+)
+
 // Open creates a new provider reading and writing from/to files under the path
 // passed using default options.
 func Open(dir string) (*DB, error) {
@@ -143,7 +148,8 @@ func newDB(conf Config, dir string) (*DB, error) {
 		db.fileOffset.Store(stat.Size())
 	}
 
-	// Load index if exists
+	// Load or rebuild the index. Rebuilds only happen on open when index.dat
+	// is missing/corrupt, so the normal read/write paths remain unchanged.
 	indexFile := indexPath(dir)
 	if fileExists(indexFile) {
 		if err := db.index.load(indexFile); err != nil {
@@ -151,6 +157,25 @@ func newDB(conf Config, dir string) (*DB, error) {
 			if err := db.rebuildIndex(); err != nil {
 				return nil, fmt.Errorf("open db: rebuild index: %w", err)
 			}
+			if err := db.saveIndex(); err != nil {
+				return nil, fmt.Errorf("open db: save rebuilt index: %w", err)
+			}
+		} else if db.index.needsRebuild(db.fileOffset.Load()) {
+			conf.Options.Log.Warn("index stale, rebuilding", "path", indexFile)
+			if err := db.rebuildIndex(); err != nil {
+				return nil, fmt.Errorf("open db: rebuild stale index: %w", err)
+			}
+			if err := db.saveIndex(); err != nil {
+				return nil, fmt.Errorf("open db: save rebuilt stale index: %w", err)
+			}
+		}
+	} else if db.fileOffset.Load() > 0 {
+		conf.Options.Log.Warn("index missing, rebuilding", "path", indexFile)
+		if err := db.rebuildIndex(); err != nil {
+			return nil, fmt.Errorf("open db: rebuild index: %w", err)
+		}
+		if err := db.saveIndex(); err != nil {
+			return nil, fmt.Errorf("open db: save rebuilt index: %w", err)
 		}
 	}
 
@@ -285,6 +310,9 @@ func (db *DB) flushWriteBuffer() {
 	if _, err := db.dataFd.WriteAt(batch, offset); err != nil {
 		db.conf.Options.Log.Error("flush: write chunk batch", "error", err)
 		return
+	}
+	if err := db.syncDataFile("flush"); err != nil {
+		db.conf.Options.Log.Error("flush: sync chunk batch", "error", err)
 	}
 
 	offset += int64(len(batch))
@@ -515,6 +543,9 @@ func (db *DB) StoreColumn(pos world.ChunkPos, dim world.Dimension, col *chunk.Co
 	db.fileOffset.Add(int64(len(data)))
 
 	db.index.put(key, offset, int64(len(data)))
+	if err := db.syncDataFile("store chunk"); err != nil {
+		return err
+	}
 	db.cache.markClean(key)
 
 	return nil
@@ -913,8 +944,122 @@ func (db *DB) decodeScheduledUpdates(data []byte) ([]chunk.ScheduledBlockUpdate,
 
 // rebuildIndex rebuilds the spatial index from the data file.
 func (db *DB) rebuildIndex() error {
-	db.index = newSpatialIndex()
+	stat, err := db.dataFd.Stat()
+	if err != nil {
+		return fmt.Errorf("stat chunks.dat: %w", err)
+	}
+
+	idx := newSpatialIndex()
+	fileSize := stat.Size()
+	offset := int64(0)
+	header := make([]byte, chunkRecordHeaderSize)
+
+	for offset < fileSize {
+		remaining := fileSize - offset
+		if remaining < chunkRecordHeaderSize {
+			db.conf.Options.Log.Warn("truncating partial chunk header", "offset", offset, "bytes", remaining)
+			if err := db.truncateDataFile(offset); err != nil {
+				return err
+			}
+			fileSize = offset
+			break
+		}
+
+		if _, err := db.dataFd.ReadAt(header, offset); err != nil {
+			return fmt.Errorf("read chunk header at %d: %w", offset, err)
+		}
+		if header[0] != 'B' || header[1] != 'L' || header[2] != 'A' || header[3] != 'Z' {
+			db.conf.Options.Log.Warn("truncating invalid chunk header", "offset", offset)
+			if err := db.truncateDataFile(offset); err != nil {
+				return err
+			}
+			fileSize = offset
+			break
+		}
+
+		size := int64(binary.LittleEndian.Uint32(header[4:8]))
+		if size < chunkRecordHeaderSize || size > maxChunkRecordSize {
+			db.conf.Options.Log.Warn("truncating invalid chunk size", "offset", offset, "size", size)
+			if err := db.truncateDataFile(offset); err != nil {
+				return err
+			}
+			fileSize = offset
+			break
+		}
+		if size > remaining {
+			db.conf.Options.Log.Warn("truncating partial chunk record", "offset", offset, "size", size, "remaining", remaining)
+			if err := db.truncateDataFile(offset); err != nil {
+				return err
+			}
+			fileSize = offset
+			break
+		}
+
+		record := make([]byte, size)
+		copy(record, header)
+		if _, err := db.dataFd.ReadAt(record[chunkRecordHeaderSize:], offset+chunkRecordHeaderSize); err != nil {
+			return fmt.Errorf("read chunk record at %d: %w", offset, err)
+		}
+		storedCRC := binary.LittleEndian.Uint32(record[8:12])
+		if computedCRC := computeCRC32(record[12:]); storedCRC != computedCRC {
+			db.conf.Options.Log.Warn("skipping corrupt chunk record", "offset", offset, "size", size)
+			offset += size
+			continue
+		}
+
+		dimID := int(int32(binary.LittleEndian.Uint32(record[20:24])))
+		dim, ok := world.DimensionByID(dimID)
+		if !ok {
+			db.conf.Options.Log.Warn("skipping chunk with unknown dimension", "offset", offset, "dimension", dimID)
+			offset += size
+			continue
+		}
+		key := chunkKey{
+			pos: world.ChunkPos{
+				int32(binary.LittleEndian.Uint32(record[12:16])),
+				int32(binary.LittleEndian.Uint32(record[16:20])),
+			},
+			dim: dim,
+		}
+		morton, indexDimID := indexLookupKey(key)
+		idx.entries[indexKey{morton: morton, dim: indexDimID}] = indexEntry{
+			offset: offset,
+			size:   size,
+			dim:    indexDimID,
+		}
+		offset += size
+	}
+
+	db.index = idx
+	db.fileOffset.Store(fileSize)
+	db.conf.Options.Log.Info("rebuilt index", "entries", idx.count(), "bytes", fileSize)
 	return nil
+}
+
+func (db *DB) truncateDataFile(size int64) error {
+	if err := db.dataFd.Truncate(size); err != nil {
+		return fmt.Errorf("truncate chunks.dat to %d: %w", size, err)
+	}
+	db.fileOffset.Store(size)
+	return nil
+}
+
+func (db *DB) syncDataFile(context string) error {
+	if db.conf.Options.Durability < DurabilityBalanced {
+		return nil
+	}
+	if err := db.dataFd.Sync(); err != nil {
+		return fmt.Errorf("%s: sync chunks.dat: %w", context, err)
+	}
+	return nil
+}
+
+func (db *DB) saveIndex() error {
+	return db.index.saveWithDataSize(
+		indexPath(db.dir),
+		db.fileOffset.Load(),
+		db.conf.Options.Durability >= DurabilityBalanced,
+	)
 }
 
 // metadata holds persisted metadata for the database.
@@ -1039,6 +1184,12 @@ func (db *DB) Compact() error {
 	db.fileOffset.Store(offset)
 	db.index.replace(compacted)
 	db.cache.clear()
+	if err := db.syncDataFile("compact"); err != nil {
+		return err
+	}
+	if err := db.saveIndex(); err != nil {
+		return fmt.Errorf("compact: save index: %w", err)
+	}
 	if err := os.Remove(backupPath); err != nil && !os.IsNotExist(err) {
 		db.conf.Options.Log.Warn("compact: remove backup", "error", err)
 	}
@@ -1068,6 +1219,9 @@ func (db *DB) Close() error {
 
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	if err := db.syncDataFile("close"); err != nil {
+		return err
+	}
 
 	db.ldat.LastPlayed = time.Now().Unix()
 
@@ -1086,7 +1240,7 @@ func (db *DB) Close() error {
 	}
 
 	// Save index
-	if err := db.index.save(indexPath(db.dir)); err != nil {
+	if err := db.saveIndex(); err != nil {
 		return fmt.Errorf("close: save index: %w", err)
 	}
 

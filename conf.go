@@ -18,6 +18,21 @@ const (
 	CompressionLZ4
 )
 
+// DurabilityMode controls how aggressively BlazeDB syncs data to disk.
+type DurabilityMode int
+
+const (
+	// DurabilityFast prioritizes throughput and latency. Writes are buffered
+	// and the OS decides when bytes reach stable storage. This is the default.
+	DurabilityFast DurabilityMode = iota
+	// DurabilityBalanced fsyncs chunks.dat after each flush batch. Data written
+	// by a completed flush can be recovered by rebuilding the index.
+	DurabilityBalanced
+	// DurabilitySafe disables write buffering and fsyncs chunks.dat before
+	// StoreColumn returns.
+	DurabilitySafe
+)
+
 // Options holds configuration options for a BlazeDB database.
 type Options struct {
 	// CacheSize is the maximum number of bytes to use for in-memory caching.
@@ -43,6 +58,10 @@ type Options struct {
 	// ParallelCompression enables parallel compression using goroutines.
 	// Defaults to true.
 	ParallelCompression bool
+
+	// Durability controls fsync and buffering behaviour.
+	// Defaults to DurabilityFast for maximum throughput.
+	Durability DurabilityMode
 
 	// AutoTuneCache enables automatic cache size adjustment based on hit rate.
 	// Defaults to true.
@@ -75,6 +94,7 @@ func DefaultOptions() *Options {
 		WriteBufferSize:     4 * 1024 * 1024,   // 4MB buffer
 		FlushInterval:       1000,              // 1 second
 		ParallelCompression: true,
+		Durability:          DurabilityFast,
 		AutoTuneCache:       true,
 		AutoTuneInterval:    30,                 // 30 seconds
 		CacheMinSize:        64 * 1024 * 1024,   // 64MB min
@@ -92,6 +112,7 @@ func BalancedOptions() *Options {
 		WriteBufferSize:     2 * 1024 * 1024,
 		FlushInterval:       500,
 		ParallelCompression: true,
+		Durability:          DurabilityBalanced,
 		Log:                 slog.Default(),
 	}
 }
@@ -105,6 +126,7 @@ func SafeOptions() *Options {
 		WriteBufferSize:     0, // Immediate writes
 		FlushInterval:       0,
 		ParallelCompression: false,
+		Durability:          DurabilitySafe,
 		Log:                 slog.Default(),
 	}
 }
@@ -120,6 +142,7 @@ func TurboOptions() *Options {
 		WriteBufferSize:     16 * 1024 * 1024, // 16MB buffer
 		FlushInterval:       5000,             // 5 second flush
 		ParallelCompression: true,
+		Durability:          DurabilityFast,
 		Log:                 slog.Default(),
 	}
 }
@@ -139,6 +162,10 @@ func (conf Config) Open(dir string) (*DB, error) {
 	}
 	if conf.Options.Log == nil {
 		conf.Options.Log = slog.Default()
+	}
+	if conf.Options.Durability == DurabilitySafe {
+		conf.Options.WriteBufferSize = 0
+		conf.Options.FlushInterval = 0
 	}
 	conf.Options.Log = conf.Options.Log.With("provider", "blazedb")
 

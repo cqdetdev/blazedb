@@ -1,0 +1,305 @@
+package blazedb
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/df-mc/dragonfly/server/world"
+	"github.com/df-mc/dragonfly/server/world/chunk"
+)
+
+func recoveryTestOptions() *Options {
+	opts := DefaultOptions()
+	opts.WriteBufferSize = 0
+	opts.FlushInterval = 0
+	opts.VerifyChecksums = true
+	opts.Log = discardTestLogger()
+	return opts
+}
+
+func recoveryTestColumn() *chunk.Column {
+	return &chunk.Column{Chunk: chunk.New(0, world.Overworld.Range())}
+}
+
+func openRecoveryDB(t *testing.T, dir string) *DB {
+	t.Helper()
+
+	db, err := Config{Options: recoveryTestOptions()}.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
+func storeRecoveryChunk(t *testing.T, db *DB, pos world.ChunkPos) (offset, size int64) {
+	t.Helper()
+
+	if err := db.StoreColumn(pos, world.Overworld, recoveryTestColumn()); err != nil {
+		t.Fatal(err)
+	}
+	offset, size, ok := db.index.get(chunkKey{pos: pos, dim: world.Overworld})
+	if !ok {
+		t.Fatalf("index missing stored chunk %v", pos)
+	}
+	return offset, size
+}
+
+func TestRebuildIndexWhenIndexDeleted(t *testing.T) {
+	dir := t.TempDir()
+	db := openRecoveryDB(t, dir)
+	positions := []world.ChunkPos{{0, 0}, {-32, 16}, {64, -64}}
+	for _, pos := range positions {
+		storeRecoveryChunk(t, db, pos)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(indexPath(dir)); err != nil {
+		t.Fatal(err)
+	}
+
+	db = openRecoveryDB(t, dir)
+	defer db.Close()
+
+	if got := db.index.count(); got != len(positions) {
+		t.Fatalf("expected rebuilt index to contain %d entries, got %d", len(positions), got)
+	}
+	for _, pos := range positions {
+		if _, err := db.LoadColumn(pos, world.Overworld); err != nil {
+			t.Fatalf("load recovered chunk %v: %v", pos, err)
+		}
+	}
+}
+
+func TestRebuildIndexWhenIndexCorrupted(t *testing.T) {
+	dir := t.TempDir()
+	db := openRecoveryDB(t, dir)
+	positions := []world.ChunkPos{{0, 0}, {8, -8}}
+	for _, pos := range positions {
+		storeRecoveryChunk(t, db, pos)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(indexPath(dir), []byte("not a valid BlazeDB index"), 0666); err != nil {
+		t.Fatal(err)
+	}
+
+	db = openRecoveryDB(t, dir)
+	defer db.Close()
+
+	for _, pos := range positions {
+		if _, err := db.LoadColumn(pos, world.Overworld); err != nil {
+			t.Fatalf("load chunk after corrupt index rebuild %v: %v", pos, err)
+		}
+	}
+}
+
+func TestRebuildIndexKeepsLatestChunkVersion(t *testing.T) {
+	dir := t.TempDir()
+	db := openRecoveryDB(t, dir)
+	pos := world.ChunkPos{4, 9}
+
+	firstOffset, _ := storeRecoveryChunk(t, db, pos)
+	latestOffset, _ := storeRecoveryChunk(t, db, pos)
+	if latestOffset <= firstOffset {
+		t.Fatalf("expected second write to append after first: first=%d latest=%d", firstOffset, latestOffset)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(indexPath(dir)); err != nil {
+		t.Fatal(err)
+	}
+
+	db = openRecoveryDB(t, dir)
+	defer db.Close()
+
+	offset, _, ok := db.index.get(chunkKey{pos: pos, dim: world.Overworld})
+	if !ok {
+		t.Fatal("rebuilt index missing chunk")
+	}
+	if offset != latestOffset {
+		t.Fatalf("rebuilt index did not keep latest version: got offset %d, want %d", offset, latestOffset)
+	}
+}
+
+func TestRebuildIndexSkipsBadChecksumRecord(t *testing.T) {
+	dir := t.TempDir()
+	db := openRecoveryDB(t, dir)
+	pos := world.ChunkPos{-7, 12}
+
+	firstOffset, _ := storeRecoveryChunk(t, db, pos)
+	latestOffset, latestSize := storeRecoveryChunk(t, db, pos)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := os.OpenFile(dataPath(dir), os.O_RDWR, 0666)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte{0x7f}, latestOffset+latestSize-1); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(indexPath(dir)); err != nil {
+		t.Fatal(err)
+	}
+
+	db = openRecoveryDB(t, dir)
+	defer db.Close()
+
+	offset, _, ok := db.index.get(chunkKey{pos: pos, dim: world.Overworld})
+	if !ok {
+		t.Fatal("rebuilt index missing previous valid chunk version")
+	}
+	if offset != firstOffset {
+		t.Fatalf("expected corrupt latest record to be skipped: got offset %d, want %d", offset, firstOffset)
+	}
+	if _, err := db.LoadColumn(pos, world.Overworld); err != nil {
+		t.Fatalf("load previous valid chunk after skipping corrupt latest: %v", err)
+	}
+}
+
+func TestRebuildIndexTruncatesPartialTailWrite(t *testing.T) {
+	dir := t.TempDir()
+	db := openRecoveryDB(t, dir)
+	pos := world.ChunkPos{2, 3}
+	storeRecoveryChunk(t, db, pos)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	before, err := os.Stat(dataPath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(dataPath(dir), os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte{'B', 'L', 'A', 'Z', 0xff}); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(indexPath(dir)); err != nil {
+		t.Fatal(err)
+	}
+
+	db = openRecoveryDB(t, dir)
+	defer db.Close()
+
+	after, err := os.Stat(dataPath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Size() != before.Size() {
+		t.Fatalf("expected partial tail to be truncated to %d bytes, got %d", before.Size(), after.Size())
+	}
+	if _, err := db.LoadColumn(pos, world.Overworld); err != nil {
+		t.Fatalf("load chunk after partial tail truncation: %v", err)
+	}
+}
+
+func TestOpenRebuildsValidButStaleIndex(t *testing.T) {
+	dir := t.TempDir()
+	db := openRecoveryDB(t, dir)
+	storeRecoveryChunk(t, db, world.ChunkPos{0, 0})
+	laterPos := world.ChunkPos{9, -9}
+	laterRecord, err := db.encodeColumn(laterPos, world.Overworld, recoveryTestColumn())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := os.OpenFile(dataPath(dir), os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(laterRecord); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db = openRecoveryDB(t, dir)
+	defer db.Close()
+
+	if _, err := db.LoadColumn(laterPos, world.Overworld); err != nil {
+		t.Fatalf("load chunk from stale-index tail rebuild: %v", err)
+	}
+}
+
+func TestSafeDurabilityDisablesWriteBuffer(t *testing.T) {
+	opts := DefaultOptions()
+	opts.Durability = DurabilitySafe
+	opts.WriteBufferSize = 4 * 1024 * 1024
+	opts.FlushInterval = 1000
+	opts.Log = discardTestLogger()
+
+	db, err := Config{Options: opts}.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if db.conf.Options.WriteBufferSize != 0 {
+		t.Fatalf("safe durability should disable write buffering, got %d", db.conf.Options.WriteBufferSize)
+	}
+	if db.conf.Options.FlushInterval != 0 {
+		t.Fatalf("safe durability should disable periodic flushing, got %d", db.conf.Options.FlushInterval)
+	}
+}
+
+func FuzzDecodeColumnRejectsCorruption(f *testing.F) {
+	opts := recoveryTestOptions()
+	db := &DB{conf: Config{Options: opts}}
+	valid, err := db.encodeColumn(world.ChunkPos{1, -1}, world.Overworld, recoveryTestColumn())
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add([]byte{})
+	f.Add([]byte("not a chunk"))
+	f.Add(valid)
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("decodeColumn panicked: %v", r)
+			}
+		}()
+		_, _ = db.decodeColumn(data, world.Overworld)
+	})
+}
+
+func FuzzSpatialIndexLoadRejectsCorruption(f *testing.F) {
+	f.Add([]byte{})
+	f.Add([]byte("not an index"))
+	f.Add([]byte{'B', 'I', 'D', 'X', 0, 0, 0, 0, 0, 0, 0, 0})
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("spatialIndex.load panicked: %v", r)
+			}
+		}()
+
+		path := filepath.Join(t.TempDir(), "index.dat")
+		if err := os.WriteFile(path, data, 0666); err != nil {
+			t.Fatal(err)
+		}
+		_ = newSpatialIndex().load(path)
+	})
+}
