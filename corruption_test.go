@@ -22,6 +22,16 @@ func recoveryTestColumn() *chunk.Column {
 	return &chunk.Column{Chunk: chunk.New(0, world.Overworld.Range())}
 }
 
+func recoveryTestColumnWithEntity(id int64) *chunk.Column {
+	return &chunk.Column{
+		Chunk: chunk.New(0, world.Overworld.Range()),
+		Entities: []chunk.Entity{{
+			ID:   id,
+			Data: map[string]any{"identifier": "blazedb:test"},
+		}},
+	}
+}
+
 func openRecoveryDB(t *testing.T, dir string) *DB {
 	t.Helper()
 
@@ -36,6 +46,19 @@ func storeRecoveryChunk(t *testing.T, db *DB, pos world.ChunkPos) (offset, size 
 	t.Helper()
 
 	if err := db.StoreColumn(pos, world.Overworld, recoveryTestColumn()); err != nil {
+		t.Fatal(err)
+	}
+	offset, size, ok := db.index.get(newChunkKey(pos, world.Overworld))
+	if !ok {
+		t.Fatalf("index missing stored chunk %v", pos)
+	}
+	return offset, size
+}
+
+func storeRecoveryColumn(t *testing.T, db *DB, pos world.ChunkPos, col *chunk.Column) (offset, size int64) {
+	t.Helper()
+
+	if err := db.StoreColumn(pos, world.Overworld, col); err != nil {
 		t.Fatal(err)
 	}
 	offset, size, ok := db.index.get(newChunkKey(pos, world.Overworld))
@@ -101,8 +124,8 @@ func TestRebuildIndexKeepsLatestChunkVersion(t *testing.T) {
 	db := openRecoveryDB(t, dir)
 	pos := world.ChunkPos{4, 9}
 
-	firstOffset, _ := storeRecoveryChunk(t, db, pos)
-	latestOffset, _ := storeRecoveryChunk(t, db, pos)
+	firstOffset, _ := storeRecoveryColumn(t, db, pos, recoveryTestColumnWithEntity(1))
+	latestOffset, _ := storeRecoveryColumn(t, db, pos, recoveryTestColumnWithEntity(2))
 	if latestOffset <= firstOffset {
 		t.Fatalf("expected second write to append after first: first=%d latest=%d", firstOffset, latestOffset)
 	}
@@ -130,8 +153,8 @@ func TestRebuildIndexSkipsBadChecksumRecord(t *testing.T) {
 	db := openRecoveryDB(t, dir)
 	pos := world.ChunkPos{-7, 12}
 
-	firstOffset, _ := storeRecoveryChunk(t, db, pos)
-	latestOffset, latestSize := storeRecoveryChunk(t, db, pos)
+	firstOffset, _ := storeRecoveryColumn(t, db, pos, recoveryTestColumnWithEntity(1))
+	latestOffset, latestSize := storeRecoveryColumn(t, db, pos, recoveryTestColumnWithEntity(2))
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -260,6 +283,102 @@ func TestSafeDurabilityDisablesWriteBuffer(t *testing.T) {
 	}
 	if db.conf.Options.FlushInterval != 0 {
 		t.Fatalf("safe durability should disable periodic flushing, got %d", db.conf.Options.FlushInterval)
+	}
+}
+
+func TestStoreColumnUnchangedImmediateSkipsAppend(t *testing.T) {
+	opts := recoveryTestOptions()
+	opts.Durability = DurabilityFast
+
+	dir := t.TempDir()
+	db, err := Config{Options: opts}.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	pos := world.ChunkPos{3, -5}
+	col := recoveryTestColumn()
+	if err := db.StoreColumn(pos, world.Overworld, col); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(dataPath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		if err := db.StoreColumn(pos, world.Overworld, col); err != nil {
+			t.Fatal(err)
+		}
+	}
+	after, err := os.Stat(dataPath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Size() != before.Size() {
+		t.Fatalf("unchanged writes should not append: before=%d after=%d", before.Size(), after.Size())
+	}
+	if skips := db.GetStats().ChunkWriteSkips; skips != 5 {
+		t.Fatalf("expected 5 unchanged write skips, got %d", skips)
+	}
+}
+
+func TestStoreColumnUnchangedSafeBatchSkipsAppend(t *testing.T) {
+	opts := SafeBatchOptions()
+	opts.Log = discardTestLogger()
+
+	dir := t.TempDir()
+	db, err := Config{Options: opts}.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	pos := world.ChunkPos{-9, 4}
+	col := recoveryTestColumn()
+	if err := db.StoreColumn(pos, world.Overworld, col); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(dataPath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := db.StoreColumn(pos, world.Overworld, col); err != nil {
+			t.Fatal(err)
+		}
+	}
+	after, err := os.Stat(dataPath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Size() != before.Size() {
+		t.Fatalf("unchanged safe-batch writes should not append: before=%d after=%d", before.Size(), after.Size())
+	}
+	if skips := db.GetStats().ChunkWriteSkips; skips != 3 {
+		t.Fatalf("expected 3 unchanged write skips, got %d", skips)
+	}
+}
+
+func TestStoreColumnChangedStillAppends(t *testing.T) {
+	opts := recoveryTestOptions()
+	opts.Durability = DurabilityFast
+
+	dir := t.TempDir()
+	db, err := Config{Options: opts}.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	pos := world.ChunkPos{6, 6}
+	firstOffset, _ := storeRecoveryColumn(t, db, pos, recoveryTestColumnWithEntity(1))
+	secondOffset, _ := storeRecoveryColumn(t, db, pos, recoveryTestColumnWithEntity(2))
+	if secondOffset <= firstOffset {
+		t.Fatalf("changed write should append after first record: first=%d second=%d", firstOffset, secondOffset)
+	}
+	if skips := db.GetStats().ChunkWriteSkips; skips != 0 {
+		t.Fatalf("changed writes should not be counted as skips, got %d", skips)
 	}
 }
 

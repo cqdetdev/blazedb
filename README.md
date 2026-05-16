@@ -6,12 +6,13 @@ It is engineered to overcome specific bottlenecks found in general-purpose KV st
 
 ## Features
 
+- **Unchanged Save Elision**: Repeated saves of byte-identical hot chunks skip disk append and fsync after an exact encoded-record comparison.
 - 🚀 **High Performance**: Optimized specifically for chunk data (reads/writes).
 - 🗺️ **Spatial Locality**: Uses Z-Order (Morton) curves to keep creating/loading nearby chunks physically close on disk, effectively acting as a hardware-level prefetch.
 - 💾 **Append-Only Storage**: Writes are always appended to the end of the file, eliminating random write seeks and "compaction stalls" during gameplay.
 - 🧠 **Smart Caching**: Sharded, thread-safe LRU cache with O(1) operations and auto-tuning capabilities.
 - ⚡ **Async Writes**: Non-blocking background write worker with buffering to prevent frame drops during heavy chunk generation.
-- 📦 **Compression**: Supports LZ4 (default, ultra-fast) and Snappy. Includes buffer pooling to minimize GC pressure.
+- 📦 **Compression**: Supports LZ4 (default, ultra-fast) and Snappy, and builds encoded records directly to minimize copying.
 - 🛡️ **Crash Safety**: Atomic offset tracking and index rebuilding capabilities.
 
 ## Architecture & How It Works
@@ -32,6 +33,10 @@ Minecraft Server
         `-- miss -> Spatial Index (Z-order map)
             `-- lookup offset -> chunks.dat
                 `-- read + decompress -> Sharded LRU Cache
+
+Repeated unchanged saves compare the new encoded record with the cached
+encoded record for that chunk. If the bytes are identical, BlazeDB returns
+without appending another record or syncing the data file.
 
 Disk files:
 |-- chunks.dat  append-only chunk data
@@ -88,15 +93,18 @@ Lower is better. These numbers are from the committed benchmark suite in `tests/
 
 | Workload | BlazeDB | LevelDB | Speedup | BlazeDB Alloc/op | LevelDB Alloc/op |
 | :--- | ---: | ---: | ---: | ---: | ---: |
-| Hot cached chunk load | ~95 ns/op | ~44.5 us/op | ~468x | 0 B | ~15.6 KB |
-| Store chunk, default LZ4 | ~4.1 us/op | ~75.5 us/op | ~18x | ~2.8 KB | ~15.7 KB |
-| Store chunk, no compression | ~3.35 us/op | ~75.5 us/op | ~22x | ~2.1 KB | ~15.7 KB |
-| Reopened tiny-cache chunk load | ~26.8 us/op | ~1.90 ms/op | ~71x | ~12.2 KB | ~734 KB |
-| Reopened 11x11 area load | ~3.24 ms/op | ~236 ms/op | ~73x | ~1.48 MB | ~86.1 MB |
-| Generated dense chunk store | ~10.3 us/op | ~167 us/op | ~16x | ~15.4 KB | ~48.0 KB |
-| Generated dense chunk reopened load | ~83 us/op | ~1.46 ms/op | ~18x | ~28.0 KB | ~637 KB |
+| Hot cached chunk load | ~82.9 ns/op | ~43.8 us/op | ~529x | 0 B | ~15.6 KB |
+| Store chunk, default LZ4 | ~4.2 us/op | ~74.8 us/op | ~18x | ~2.8 KB | ~15.6 KB |
+| Store chunk, no compression | ~3.57 us/op | ~74.8 us/op | ~21x | ~2.2 KB | ~15.6 KB |
+| Repeated unchanged chunk save, safe mode | ~5.47 us/op | ~55.8 us/op | ~10x | ~2.1 KB | ~17.3 KB |
+| Reopened tiny-cache chunk load | ~26.9 us/op | ~1.93 ms/op | ~72x | ~12.2 KB | ~734 KB |
+| Reopened 11x11 area load | ~3.21 ms/op | ~236.6 ms/op | ~74x | ~1.48 MB | ~86.2 MB |
+| Generated dense chunk store | ~11.2 us/op | ~166.4 us/op | ~15x | ~15.4 KB | ~48.0 KB |
+| Generated dense chunk reopened load | ~84.0 us/op | ~1.48 ms/op | ~18x | ~28.1 KB | ~637 KB |
 
 BlazeDB also caches negative area misses. In sparse repeated area scans, the benchmarked path drops from about `190 us/op` cold to about `11.1 us/op` once misses are cached.
+
+For repeated same-position saves of unchanged chunks, BlazeDB keeps the last encoded hot record in the chunk cache and performs an exact byte comparison before committing a new record. In the targeted benchmark, `DurabilitySafe` unchanged saves dropped from about `548 us/op` before this optimization to about `5.47 us/op`, while `DurabilitySafeBatch` unchanged saves measured about `6.75 us/op`. Dense unchanged safe saves still pay Dragonfly encode cost and measured about `31.2 us/op`, but skip the expensive append/fsync step.
 
 Safety mode store costs from the same benchmark run:
 

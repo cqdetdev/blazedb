@@ -30,7 +30,11 @@ func TestCompactRewritesLiveChunks(t *testing.T) {
 	positions := []world.ChunkPos{{0, 0}, {-32, 16}, {64, -64}}
 	for i := 0; i < 5; i++ {
 		for _, pos := range positions {
-			if err := db.StoreColumn(pos, world.Overworld, col); err != nil {
+			next := col
+			if i > 0 {
+				next = recoveryTestColumnWithEntity(int64(i))
+			}
+			if err := db.StoreColumn(pos, world.Overworld, next); err != nil {
 				t.Fatal(err)
 			}
 		}

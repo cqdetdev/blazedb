@@ -33,9 +33,10 @@ type cacheShard struct {
 
 // cacheEntry represents a cached chunk with metadata.
 type cacheEntry struct {
-	key  chunkKey
-	col  *chunk.Column
-	size int64
+	key    chunkKey
+	col    *chunk.Column
+	record []byte
+	size   int64
 }
 
 // newChunkCache creates a new chunk cache with the given max size in bytes.
@@ -94,7 +95,7 @@ func (c *chunkCache) get(key chunkKey) *chunk.Column {
 	return col
 }
 
-// put adds a chunk to the cache, marking it as dirty.
+// put adds a chunk to the cache.
 func (c *chunkCache) put(key chunkKey, col *chunk.Column) {
 	c.writes.Add(1)
 	shard := c.shard(key)
@@ -108,6 +109,7 @@ func (c *chunkCache) put(key chunkKey, col *chunk.Column) {
 	// Update existing entry
 	if elem, ok := shard.entries[key]; ok {
 		entry := elem.Value.(*cacheEntry)
+		size += int64(len(entry.record))
 		shard.size.Add(size - entry.size)
 		entry.col = col
 		entry.size = size
@@ -150,14 +152,26 @@ func (c *chunkCache) put(key chunkKey, col *chunk.Column) {
 
 // putClean adds a chunk loaded from disk (not dirty).
 func (c *chunkCache) putClean(key chunkKey, col *chunk.Column) {
+	c.putCleanWithRecord(key, col, nil)
+}
+
+func (c *chunkCache) putCleanWithRecord(key chunkKey, col *chunk.Column, record []byte) {
 	shard := c.shard(key)
 	size := int64(len(col.Chunk.Sub()) * 4096 * 2)
+	if record != nil {
+		size += int64(len(record))
+	}
 
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
 	if elem, ok := shard.entries[key]; ok {
 		entry := elem.Value.(*cacheEntry)
+		if record == nil {
+			size += int64(len(entry.record))
+		} else {
+			entry.record = record
+		}
 		shard.size.Add(size - entry.size)
 		entry.col = col
 		entry.size = size
@@ -188,13 +202,59 @@ func (c *chunkCache) putClean(key chunkKey, col *chunk.Column) {
 	}
 
 	entry := &cacheEntry{
-		key:  key,
-		col:  col,
-		size: size,
+		key:    key,
+		col:    col,
+		record: record,
+		size:   size,
 	}
 	elem := shard.lru.PushFront(entry)
 	shard.entries[key] = elem
 	shard.size.Add(size)
+}
+
+func (c *chunkCache) record(key chunkKey) []byte {
+	shard := c.shard(key)
+
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
+
+	elem, ok := shard.entries[key]
+	if !ok {
+		return nil
+	}
+	return elem.Value.(*cacheEntry).record
+}
+
+func (c *chunkCache) putRecord(key chunkKey, record []byte) {
+	if record == nil {
+		return
+	}
+	shard := c.shard(key)
+
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	elem, ok := shard.entries[key]
+	if !ok {
+		return
+	}
+	entry := elem.Value.(*cacheEntry)
+	delta := int64(len(record) - len(entry.record))
+	entry.record = record
+	entry.size += delta
+	shard.size.Add(delta)
+	shard.lru.MoveToFront(elem)
+
+	for shard.size.Load() > shard.maxSize && shard.lru.Len() > 0 {
+		oldest := shard.lru.Back()
+		if oldest == nil || oldest == elem {
+			break
+		}
+		oldEntry := oldest.Value.(*cacheEntry)
+		shard.size.Add(-oldEntry.size)
+		delete(shard.entries, oldEntry.key)
+		shard.lru.Remove(oldest)
+	}
 }
 
 // currentSize returns the current estimated size of the cache.

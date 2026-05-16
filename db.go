@@ -61,6 +61,8 @@ type DB struct {
 	// Predictive prefetcher for chunk loading
 	prefetcher *Prefetcher
 
+	writeSkips atomic.Int64
+
 	// Player spawn positions (stored in-memory, persisted on close)
 	playerSpawns   map[uuid.UUID]cube.Pos
 	playerSpawnsMu sync.RWMutex
@@ -78,6 +80,7 @@ type pendingWrite struct {
 	sortKey  uint64
 	data     []byte
 	dataSize int64
+	skipped  bool
 }
 
 type pendingEncode struct {
@@ -287,8 +290,19 @@ func (db *DB) flushWriteBuffer() error {
 	}
 
 	totalSize := 0
+	persisted := 0
 	for _, write := range writes {
+		if write.skipped {
+			continue
+		}
 		totalSize += len(write.data)
+		persisted++
+	}
+	if persisted == 0 {
+		if len(writes) != len(toWrite) {
+			return fmt.Errorf("flush: no chunks encoded")
+		}
+		return nil
 	}
 
 	sort.Slice(writes, func(i, j int) bool {
@@ -302,6 +316,9 @@ func (db *DB) flushWriteBuffer() error {
 	batch := make([]byte, 0, totalSize)
 	updates := make([]indexUpdate, 0, len(writes))
 	for _, write := range writes {
+		if write.skipped {
+			continue
+		}
 		writeOffset := offset + int64(len(batch))
 		batch = append(batch, write.data...)
 		updates = append(updates, indexUpdate{
@@ -329,6 +346,11 @@ func (db *DB) flushWriteBuffer() error {
 	offset += int64(len(batch))
 	db.fileOffset.Store(offset)
 	db.index.putBatch(updates)
+	for _, write := range writes {
+		if !write.skipped {
+			db.cache.putRecord(write.key, write.data)
+		}
+	}
 	return nil
 }
 
@@ -408,6 +430,15 @@ func (db *DB) encodePendingWrites(toWrite map[chunkKey]*chunk.Column) []pendingW
 					db.conf.Options.Log.Error("flush: encode chunk", "error", err)
 					continue
 				}
+				if db.isUnchangedRecord(task.key, data) {
+					db.writeSkips.Add(1)
+					writes[idx] = pendingWrite{
+						key:     task.key,
+						sortKey: task.sortKey,
+						skipped: true,
+					}
+					continue
+				}
 				writes[idx] = pendingWrite{
 					key:      task.key,
 					sortKey:  task.sortKey,
@@ -425,7 +456,7 @@ func (db *DB) encodePendingWrites(toWrite map[chunkKey]*chunk.Column) []pendingW
 
 	n := 0
 	for _, write := range writes {
-		if write.data != nil {
+		if write.data != nil || write.skipped {
 			writes[n] = write
 			n++
 		}
@@ -439,6 +470,15 @@ func (db *DB) encodePendingWritesSequential(tasks []pendingEncode) []pendingWrit
 		data, err := db.encodeColumnForKey(task.key, task.col)
 		if err != nil {
 			db.conf.Options.Log.Error("flush: encode chunk", "error", err)
+			continue
+		}
+		if db.isUnchangedRecord(task.key, data) {
+			db.writeSkips.Add(1)
+			writes = append(writes, pendingWrite{
+				key:     task.key,
+				sortKey: task.sortKey,
+				skipped: true,
+			})
 			continue
 		}
 		writes = append(writes, pendingWrite{
@@ -541,8 +581,9 @@ func (db *DB) loadColumnAfterCacheMiss(key chunkKey, dim world.Dimension) (*chun
 		return nil, fmt.Errorf("decode column: %w", err)
 	}
 
-	// Add to cache (loaded from disk = clean)
-	db.cache.putClean(key, col)
+	// Add to cache with the exact encoded record so unchanged future saves can
+	// skip append/fsync after byte-for-byte comparison.
+	db.cache.putCleanWithRecord(key, col, data)
 
 	return col, nil
 }
@@ -577,6 +618,10 @@ func (db *DB) StoreColumn(pos world.ChunkPos, dim world.Dimension, col *chunk.Co
 	if err != nil {
 		return fmt.Errorf("encode column: %w", err)
 	}
+	if db.isUnchangedRecord(key, data) {
+		db.writeSkips.Add(1)
+		return nil
+	}
 
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -594,8 +639,17 @@ func (db *DB) StoreColumn(pos world.ChunkPos, dim world.Dimension, col *chunk.Co
 	if err := db.syncDataFile("store chunk"); err != nil {
 		return err
 	}
+	db.cache.putRecord(key, data)
 
 	return nil
+}
+
+func (db *DB) isUnchangedRecord(key chunkKey, data []byte) bool {
+	record := db.cache.record(key)
+	if len(record) == 0 || len(record) != len(data) {
+		return false
+	}
+	return bytes.Equal(record, data)
 }
 
 // LoadArea loads multiple chunks in the given radius around center position.
@@ -1164,7 +1218,9 @@ func (db *DB) NewColumnIterator(r *IteratorRange) *ColumnIterator {
 
 // GetStats returns performance statistics for the database.
 func (db *DB) GetStats() *Stats {
-	return db.cache.stats()
+	stats := db.cache.stats()
+	stats.ChunkWriteSkips = db.writeSkips.Load()
+	return stats
 }
 
 // Prefetcher returns the prefetcher for registering player positions.
@@ -1335,6 +1391,7 @@ func (key chunkKey) dimension() world.Dimension {
 type Stats struct {
 	ChunkReads      int64
 	ChunkWrites     int64
+	ChunkWriteSkips int64
 	CacheHits       int64
 	CacheMisses     int64
 	CompressionTime time.Duration
@@ -1358,6 +1415,7 @@ func (db *DB) StartStatsLogger(interval time.Duration) (stop func()) {
 				db.conf.Options.Log.Info("BlazeDB Stats",
 					"reads", stats.ChunkReads,
 					"writes", stats.ChunkWrites,
+					"write_skips", stats.ChunkWriteSkips,
 					"cache_hits", stats.CacheHits,
 					"cache_misses", stats.CacheMisses,
 					"cache_hit_rate", fmt.Sprintf("%.1f%%", hitRate),
@@ -1386,6 +1444,7 @@ func (db *DB) LogStats() {
 	db.conf.Options.Log.Info("BlazeDB Stats",
 		"reads", stats.ChunkReads,
 		"writes", stats.ChunkWrites,
+		"write_skips", stats.ChunkWriteSkips,
 		"cache_hits", stats.CacheHits,
 		"cache_hit_rate", fmt.Sprintf("%.1f%%", hitRate),
 		"index_entries", db.index.count(),
