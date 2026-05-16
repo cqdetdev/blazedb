@@ -31,6 +31,9 @@ const (
 	// DurabilitySafe disables write buffering and fsyncs chunks.dat before
 	// StoreColumn returns.
 	DurabilitySafe
+	// DurabilitySafeBatch buffers a caller's write, flushes all currently
+	// pending writes as a synced batch, and only returns after that flush.
+	DurabilitySafeBatch
 )
 
 // Options holds configuration options for a BlazeDB database.
@@ -131,6 +134,21 @@ func SafeOptions() *Options {
 	}
 }
 
+// SafeBatchOptions returns options that preserve StoreColumn durability while
+// allowing concurrent callers to share synced flush batches.
+func SafeBatchOptions() *Options {
+	return &Options{
+		CacheSize:           128 * 1024 * 1024,
+		Compression:         CompressionSnappy,
+		VerifyChecksums:     true,
+		WriteBufferSize:     4 * 1024 * 1024,
+		FlushInterval:       0,
+		ParallelCompression: true,
+		Durability:          DurabilitySafeBatch,
+		Log:                 slog.Default(),
+	}
+}
+
 // TurboOptions returns options for maximum write speed.
 // Use this for benchmarking or when you need extreme performance.
 // WARNING: Data loss possible on crash due to aggressive buffering.
@@ -165,6 +183,12 @@ func (conf Config) Open(dir string) (*DB, error) {
 	}
 	if conf.Options.Durability == DurabilitySafe {
 		conf.Options.WriteBufferSize = 0
+		conf.Options.FlushInterval = 0
+	}
+	if conf.Options.Durability == DurabilitySafeBatch {
+		if conf.Options.WriteBufferSize <= 0 {
+			conf.Options.WriteBufferSize = 4 * 1024 * 1024
+		}
 		conf.Options.FlushInterval = 0
 	}
 	conf.Options.Log = conf.Options.Log.With("provider", "blazedb")

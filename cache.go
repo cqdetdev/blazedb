@@ -4,7 +4,6 @@ import (
 	"container/list"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/df-mc/dragonfly/server/world/chunk"
 )
@@ -34,11 +33,9 @@ type cacheShard struct {
 
 // cacheEntry represents a cached chunk with metadata.
 type cacheEntry struct {
-	key        chunkKey
-	col        *chunk.Column
-	lastAccess time.Time
-	size       int64
-	dirty      bool
+	key  chunkKey
+	col  *chunk.Column
+	size int64
 }
 
 // newChunkCache creates a new chunk cache with the given max size in bytes.
@@ -59,9 +56,7 @@ func newChunkCache(maxSize int64) *chunkCache {
 
 // shard returns the shard for a given key using fast hash.
 func (c *chunkCache) shard(key chunkKey) *cacheShard {
-	// Fast hash using position only - dimension is already encoded in the key
-	// Avoid calling key.dim.Range() which is expensive
-	h := uint32(key.pos[0])*31 + uint32(key.pos[1])
+	h := uint32(key.x)*31 + uint32(key.z) + uint32(key.dimID)*131
 	return c.shards[h&(cacheShardCount-1)] // Bitwise AND is faster than modulo for power of 2
 }
 
@@ -115,9 +110,7 @@ func (c *chunkCache) put(key chunkKey, col *chunk.Column) {
 		entry := elem.Value.(*cacheEntry)
 		shard.size.Add(size - entry.size)
 		entry.col = col
-		entry.lastAccess = time.Now()
 		entry.size = size
-		entry.dirty = true
 		shard.lru.MoveToFront(elem)
 		for shard.size.Load() > shard.maxSize && shard.lru.Len() > 0 {
 			oldest := shard.lru.Back()
@@ -146,11 +139,9 @@ func (c *chunkCache) put(key chunkKey, col *chunk.Column) {
 
 	// Add new entry
 	entry := &cacheEntry{
-		key:        key,
-		col:        col,
-		lastAccess: time.Now(),
-		size:       size,
-		dirty:      true,
+		key:  key,
+		col:  col,
+		size: size,
 	}
 	elem := shard.lru.PushFront(entry)
 	shard.entries[key] = elem
@@ -169,9 +160,7 @@ func (c *chunkCache) putClean(key chunkKey, col *chunk.Column) {
 		entry := elem.Value.(*cacheEntry)
 		shard.size.Add(size - entry.size)
 		entry.col = col
-		entry.lastAccess = time.Now()
 		entry.size = size
-		entry.dirty = false
 		shard.lru.MoveToFront(elem)
 		for shard.size.Load() > shard.maxSize && shard.lru.Len() > 0 {
 			oldest := shard.lru.Back()
@@ -199,40 +188,13 @@ func (c *chunkCache) putClean(key chunkKey, col *chunk.Column) {
 	}
 
 	entry := &cacheEntry{
-		key:        key,
-		col:        col,
-		lastAccess: time.Now(),
-		size:       size,
-		dirty:      false,
+		key:  key,
+		col:  col,
+		size: size,
 	}
 	elem := shard.lru.PushFront(entry)
 	shard.entries[key] = elem
 	shard.size.Add(size)
-}
-
-// markClean marks a chunk as clean (saved to disk).
-func (c *chunkCache) markClean(key chunkKey) {
-	shard := c.shard(key)
-	shard.mu.Lock()
-	if elem, ok := shard.entries[key]; ok {
-		elem.Value.(*cacheEntry).dirty = false
-	}
-	shard.mu.Unlock()
-}
-
-// getDirtyChunks returns all chunks that have been modified.
-func (c *chunkCache) getDirtyChunks() []chunkKey {
-	dirty := make([]chunkKey, 0, 64)
-	for _, shard := range c.shards {
-		shard.mu.RLock()
-		for key, elem := range shard.entries {
-			if elem.Value.(*cacheEntry).dirty {
-				dirty = append(dirty, key)
-			}
-		}
-		shard.mu.RUnlock()
-	}
-	return dirty
 }
 
 // currentSize returns the current estimated size of the cache.

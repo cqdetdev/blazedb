@@ -84,35 +84,39 @@ To handle the high concurrency of a multi-player server, the in-memory cache is 
 
 ## Benchmarks
 
-Lower is better. These numbers are from the committed benchmark suite in `tests/benchmark_test.go`, run locally on Windows/amd64 with an AMD Ryzen 7 7730U and Go 1.26.3. The benchmark columns use synthetic Dragonfly `chunk.Column` values; default BlazeDB rows use LZ4 compression unless noted. Allocation columns are `-benchmem` per-operation allocation, not total process RSS.
+Lower is better. These numbers are from the committed benchmark suite in `tests/benchmark_test.go`, run locally on Windows/amd64 with an AMD Ryzen 7 7730U and Go 1.26.3. The benchmark columns use synthetic Dragonfly `chunk.Column` values plus a generated dense Dragonfly-style chunk fixture; default BlazeDB rows use LZ4 compression unless noted. Allocation columns are `-benchmem` per-operation allocation, not total process RSS.
 
 | Workload | BlazeDB | LevelDB | Speedup | BlazeDB Alloc/op | LevelDB Alloc/op |
 | :--- | ---: | ---: | ---: | ---: | ---: |
-| Hot cached chunk load | ~0.85 us/op | ~3.36 us/op | ~4.0x | ~157 B | ~564 B |
-| Store chunk, default LZ4 | ~5.8 us/op | ~74 us/op | ~13x | ~3.6 KB | ~15-16 KB |
-| Store chunk, no compression | ~3.9 us/op | ~74 us/op | ~19x | ~2.9 KB | ~15-16 KB |
-| Reopened tiny-cache chunk load | ~27.1 us/op | ~1.91 ms/op | ~70x | ~12.3 KB | ~692-733 KB |
-| Reopened 11x11 area load | ~3.26 ms/op | ~236 ms/op | ~72x | ~1.48 MB | ~86.1 MB |
+| Hot cached chunk load | ~95 ns/op | ~44.5 us/op | ~468x | 0 B | ~15.6 KB |
+| Store chunk, default LZ4 | ~4.1 us/op | ~75.5 us/op | ~18x | ~2.8 KB | ~15.7 KB |
+| Store chunk, no compression | ~3.35 us/op | ~75.5 us/op | ~22x | ~2.1 KB | ~15.7 KB |
+| Reopened tiny-cache chunk load | ~26.8 us/op | ~1.90 ms/op | ~71x | ~12.2 KB | ~734 KB |
+| Reopened 11x11 area load | ~3.24 ms/op | ~236 ms/op | ~73x | ~1.48 MB | ~86.1 MB |
+| Generated dense chunk store | ~10.3 us/op | ~167 us/op | ~16x | ~15.4 KB | ~48.0 KB |
+| Generated dense chunk reopened load | ~83 us/op | ~1.46 ms/op | ~18x | ~28.0 KB | ~637 KB |
 
-BlazeDB also caches negative area misses. In sparse repeated area scans, the benchmarked path drops from about `279 us/op` cold to about `17.1 us/op` once misses are cached.
+BlazeDB also caches negative area misses. In sparse repeated area scans, the benchmarked path drops from about `190 us/op` cold to about `11.1 us/op` once misses are cached.
 
 Safety mode store costs from the same benchmark run:
 
 | Mode | Store Cost | vs LevelDB Store | Recommended Use |
 | :--- | ---: | ---: | :--- |
-| `DurabilityFast` | ~5.8 us/op | ~13x faster | Benchmarks, bulk conversion, local testing, and worlds where losing recent buffered writes is acceptable. |
-| `DurabilityBalanced` | ~4.0 us/op | ~18x faster | Recommended server mode: keeps buffered throughput while syncing completed flush batches. |
-| `DurabilitySafe` | ~556 us/op | ~7.5x slower | Critical writes where `StoreColumn` must not return until chunk bytes are synced to disk. |
+| `DurabilityFast` | ~4.1 us/op | ~18x faster | Benchmarks, bulk conversion, local testing, and worlds where losing recent buffered writes is acceptable. |
+| `DurabilityBalanced` | ~3.6 us/op | ~21x faster | Recommended server mode: keeps buffered throughput while syncing completed flush batches. |
+| `DurabilitySafe` | ~558 us/op | ~7.4x slower | Critical single-threaded writes where `StoreColumn` must not return until chunk bytes are synced to disk. |
+| `DurabilitySafeBatch` | ~551 us/op sequential; ~285 us/op parallel | ~7.3x slower sequential; ~3.8x slower parallel | Concurrent critical writes that can share synced flush batches while preserving per-call durability. |
 
 ## Safety Modes
 
-BlazeDB exposes three durability modes so you can choose the safety/performance tradeoff explicitly:
+BlazeDB exposes four durability modes so you can choose the safety/performance tradeoff explicitly:
 
 | Mode | What It Guarantees | Performance Cost |
 | :--- | :--- | :--- |
 | `DurabilityFast` | Recent writes may be lost if the process or machine dies before buffered data reaches disk. Existing synced chunk records can still be recovered by index rebuild. | Fastest write path; no fsync on store/flush. |
 | `DurabilityBalanced` | Once a flush batch completes, its chunk bytes are fsynced and recoverable even if `index.dat` is stale or corrupted. Writes still return when queued, so the latest queued writes can be lost before the next flush. | Near-fast-mode caller latency; fsync cost is paid per flush batch. |
 | `DurabilitySafe` | `StoreColumn` writes the chunk record and fsyncs `chunks.dat` before returning. If the newest record is later corrupt, rebuild can fall back to the previous valid record. | Slowest mode because every store pays storage sync latency. |
+| `DurabilitySafeBatch` | `StoreColumn` returns only after the caller's write has been included in a synced flush. Concurrent callers may share the same fsync. | Similar to `DurabilitySafe` for single writes, faster under concurrent critical write bursts. |
 
 ```go
 opts := blazedb.BalancedOptions() // recommended for production servers
@@ -123,6 +127,13 @@ Use `SafeOptions()` when per-call durability matters more than throughput:
 
 ```go
 opts := blazedb.SafeOptions()
+db, err := blazedb.Config{Options: opts}.Open("world_blazedb")
+```
+
+Use `SafeBatchOptions()` when multiple goroutines may save critical chunks at the same time and each caller still needs to wait for synced bytes:
+
+```go
+opts := blazedb.SafeBatchOptions()
 db, err := blazedb.Config{Options: opts}.Open("world_blazedb")
 ```
 
@@ -224,12 +235,12 @@ if err := iter.Error(); err != nil {
 | `WriteBufferSize` | `4MB` | Size of the in-memory write buffer before forcing a flush. |
 | `FlushInterval` | `1000ms` | Simple periodic background flushes. |
 | `VerifyChecksums` | `false` | Verify CRC32 checksums on read (costs CPU). |
-| `Durability` | `DurabilityFast` | Fsync/buffering policy (`Fast`, `Balanced`, `Safe`). |
+| `Durability` | `DurabilityFast` | Fsync/buffering policy (`Fast`, `Balanced`, `Safe`, `SafeBatch`). |
 | `Log` | `slog.Default()` | Logger for debug/error messages. |
 
 `TurboOptions()` uses a `512MB` cache, `CompressionNone`, a `16MB` write buffer, and a `5000ms` flush interval for maximum write throughput when crash-window tradeoffs are acceptable.
 
-`BalancedOptions()` enables `DurabilityBalanced`, checksum verification, Snappy compression, and smaller flush batches. `SafeOptions()` enables `DurabilitySafe`, checksum verification, immediate writes, and no background write buffer.
+`BalancedOptions()` enables `DurabilityBalanced`, checksum verification, Snappy compression, and smaller flush batches. `SafeOptions()` enables `DurabilitySafe`, checksum verification, immediate writes, and no background write buffer. `SafeBatchOptions()` enables `DurabilitySafeBatch` for synced batch commits across concurrent callers.
 
 ### Credits
 - Antigravity and Claude Code

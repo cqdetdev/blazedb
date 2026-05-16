@@ -35,7 +35,7 @@ func newColumnIterator(db *DB, r *IteratorRange) *ColumnIterator {
 
 	// Collect all keys that match the range
 	db.index.iterate(func(key chunkKey, offset, size int64) bool {
-		if r.within(key.pos, key.dim) {
+		if r.within(key.pos(), key.dimension()) {
 			iter.keys = append(iter.keys, key)
 		}
 		return true
@@ -59,8 +59,8 @@ func (iter *ColumnIterator) Next() bool {
 	}
 
 	key := iter.keys[iter.current]
-	iter.pos = key.pos
-	iter.dim = key.dim
+	iter.pos = key.pos()
+	iter.dim = key.dimension()
 
 	var err error
 	iter.col, err = iter.db.LoadColumn(iter.pos, iter.dim)

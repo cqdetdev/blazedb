@@ -4,9 +4,11 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"sync/atomic"
 	"testing"
 
 	"github.com/cqdetdev/blazedb"
+	"github.com/df-mc/dragonfly/server/block"
 	"github.com/df-mc/dragonfly/server/block/cube"
 	"github.com/df-mc/dragonfly/server/world"
 	"github.com/df-mc/dragonfly/server/world/chunk"
@@ -19,6 +21,41 @@ func createTestColumn(r cube.Range) *chunk.Column {
 	// We just need a chunk.Column, the actual content doesn't matter for benchmarks
 	c := chunk.New(0, r) // 0 is typically air
 	return &chunk.Column{Chunk: c}
+}
+
+func createDenseTestColumn(r cube.Range) *chunk.Column {
+	c := chunk.New(0, r)
+	stone := runtimeIDForBlock(block.Stone{})
+	dirt := runtimeIDForBlock(block.Dirt{})
+	water := runtimeIDForBlock(block.Water{Still: true, Depth: 8})
+
+	for x := uint8(0); x < 16; x++ {
+		for z := uint8(0); z < 16; z++ {
+			height := int16(48 + (int(x)*3+int(z)*5)%24)
+			for y := int16(0); y < height; y++ {
+				id := stone
+				if y >= height-4 {
+					id = dirt
+				}
+				c.SetBlock(x, y, z, 0, id)
+			}
+			if (int(x)+int(z))%7 == 0 {
+				c.SetBlock(x, height, z, 0, water)
+				c.SetBlock(x, height+1, z, 0, water)
+			}
+		}
+	}
+	c.Compact()
+	return &chunk.Column{Chunk: c}
+}
+
+func runtimeIDForBlock(b world.Block) uint32 {
+	name, properties := b.EncodeBlock()
+	rid, ok := chunk.StateToRuntimeID(name, properties)
+	if !ok {
+		panic("unknown benchmark block state: " + name)
+	}
+	return rid
 }
 
 func discardLogger() *slog.Logger {
@@ -88,6 +125,40 @@ func populateLevelDB(tb testing.TB, dir string, positions []world.ChunkPos, opts
 	}
 }
 
+func populateBlazeDBWithColumn(tb testing.TB, dir string, positions []world.ChunkPos, opts *blazedb.Options, col *chunk.Column) {
+	tb.Helper()
+
+	db, err := blazedb.Config{Options: opts}.Open(dir)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	for _, pos := range positions {
+		if err := db.StoreColumn(pos, world.Overworld, col); err != nil {
+			tb.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		tb.Fatal(err)
+	}
+}
+
+func populateLevelDBWithColumn(tb testing.TB, dir string, positions []world.ChunkPos, opts *opt.Options, col *chunk.Column) {
+	tb.Helper()
+
+	db, err := mcdb.Config{Log: discardLogger(), LDBOptions: opts}.Open(dir)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	for _, pos := range positions {
+		if err := db.StoreColumn(pos, world.Overworld, col); err != nil {
+			tb.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		tb.Fatal(err)
+	}
+}
+
 func loadArea(db interface {
 	LoadColumn(world.ChunkPos, world.Dimension) (*chunk.Column, error)
 }, center world.ChunkPos, radius int, dim world.Dimension) error {
@@ -112,8 +183,8 @@ func BenchmarkBlazeDBLoad(b *testing.B) {
 	defer db.Close()
 
 	// Pre-populate with some chunks
-	for i := 0; i < 100; i++ {
-		pos := world.ChunkPos{int32(i % 10), int32(i / 10)}
+	positions := benchmarkPositions(10, 10)
+	for _, pos := range positions {
 		col := createTestColumn(world.Overworld.Range())
 		if err := db.StoreColumn(pos, world.Overworld, col); err != nil {
 			b.Fatal(err)
@@ -122,7 +193,7 @@ func BenchmarkBlazeDBLoad(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		pos := world.ChunkPos{int32(i % 10), int32(i / 10)}
+		pos := positions[i%len(positions)]
 		_, _ = db.LoadColumn(pos, world.Overworld)
 	}
 }
@@ -220,6 +291,105 @@ func BenchmarkBlazeDBStoreSafe(b *testing.B) {
 	}
 }
 
+func BenchmarkBlazeDBStoreSafeBatch(b *testing.B) {
+	dir := b.TempDir()
+	opts := blazedb.SafeBatchOptions()
+	opts.Log = discardLogger()
+	db, err := blazedb.Config{Options: opts}.Open(dir)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+
+	col := createTestColumn(world.Overworld.Range())
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		pos := world.ChunkPos{int32(i % 1000), int32(i / 1000)}
+		_ = db.StoreColumn(pos, world.Overworld, col)
+	}
+}
+
+func BenchmarkBlazeDBStoreSafeParallel(b *testing.B) {
+	dir := b.TempDir()
+	opts := blazedb.SafeOptions()
+	opts.Log = discardLogger()
+	db, err := blazedb.Config{Options: opts}.Open(dir)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+
+	col := createTestColumn(world.Overworld.Range())
+	var n atomic.Int64
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			i := n.Add(1)
+			pos := world.ChunkPos{int32(i % 1000), int32(i / 1000)}
+			_ = db.StoreColumn(pos, world.Overworld, col)
+		}
+	})
+}
+
+func BenchmarkBlazeDBStoreSafeBatchParallel(b *testing.B) {
+	dir := b.TempDir()
+	opts := blazedb.SafeBatchOptions()
+	opts.Log = discardLogger()
+	db, err := blazedb.Config{Options: opts}.Open(dir)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+
+	col := createTestColumn(world.Overworld.Range())
+	var n atomic.Int64
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			i := n.Add(1)
+			pos := world.ChunkPos{int32(i % 1000), int32(i / 1000)}
+			_ = db.StoreColumn(pos, world.Overworld, col)
+		}
+	})
+}
+
+func BenchmarkBlazeDBStoreDense(b *testing.B) {
+	dir := b.TempDir()
+	db, err := blazedb.Config{Options: blazeOptions(256*1024*1024, 4*1024*1024)}.Open(dir)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+
+	col := createDenseTestColumn(world.Overworld.Range())
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		pos := world.ChunkPos{int32(i % 1000), int32(i / 1000)}
+		_ = db.StoreColumn(pos, world.Overworld, col)
+	}
+}
+
+func BenchmarkLevelDBStoreDense(b *testing.B) {
+	dir := b.TempDir()
+	db, err := mcdb.Config{Log: discardLogger(), LDBOptions: &opt.Options{NoSync: true}}.Open(dir)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+
+	col := createDenseTestColumn(world.Overworld.Range())
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		pos := world.ChunkPos{int32(i % 1000), int32(i / 1000)}
+		_ = db.StoreColumn(pos, world.Overworld, col)
+	}
+}
+
 // BenchmarkLevelDBLoad benchmarks chunk loading from LevelDB.
 func BenchmarkLevelDBLoad(b *testing.B) {
 	dir := b.TempDir()
@@ -230,8 +400,8 @@ func BenchmarkLevelDBLoad(b *testing.B) {
 	defer db.Close()
 
 	// Pre-populate with some chunks
-	for i := 0; i < 100; i++ {
-		pos := world.ChunkPos{int32(i % 10), int32(i / 10)}
+	positions := benchmarkPositions(10, 10)
+	for _, pos := range positions {
 		col := createTestColumn(world.Overworld.Range())
 		if err := db.StoreColumn(pos, world.Overworld, col); err != nil {
 			b.Fatal(err)
@@ -240,7 +410,7 @@ func BenchmarkLevelDBLoad(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		pos := world.ChunkPos{int32(i % 10), int32(i / 10)}
+		pos := positions[i%len(positions)]
 		_, _ = db.LoadColumn(pos, world.Overworld)
 	}
 }
@@ -394,6 +564,48 @@ func BenchmarkLevelDBLoadReopenedNoBlockCache(b *testing.B) {
 	dir := b.TempDir()
 	positions := benchmarkPositions(64, 64)
 	populateLevelDB(b, dir, positions, levelOptionsNoCache())
+
+	db, err := mcdb.Config{Log: discardLogger(), LDBOptions: levelOptionsNoCache()}.Open(dir)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		pos := positions[i%len(positions)]
+		if _, err := db.LoadColumn(pos, world.Overworld); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkBlazeDBLoadReopenedDenseTinyCache(b *testing.B) {
+	dir := b.TempDir()
+	positions := benchmarkPositions(16, 16)
+	col := createDenseTestColumn(world.Overworld.Range())
+	populateBlazeDBWithColumn(b, dir, positions, blazeOptions(1, 0), col)
+
+	db, err := blazedb.Config{Options: blazeOptions(1, 0)}.Open(dir)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		pos := positions[i%len(positions)]
+		if _, err := db.LoadColumn(pos, world.Overworld); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkLevelDBLoadReopenedDenseNoBlockCache(b *testing.B) {
+	dir := b.TempDir()
+	positions := benchmarkPositions(16, 16)
+	col := createDenseTestColumn(world.Overworld.Range())
+	populateLevelDBWithColumn(b, dir, positions, levelOptionsNoCache(), col)
 
 	db, err := mcdb.Config{Log: discardLogger(), LDBOptions: levelOptionsNoCache()}.Open(dir)
 	if err != nil {

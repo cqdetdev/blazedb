@@ -38,7 +38,7 @@ func storeRecoveryChunk(t *testing.T, db *DB, pos world.ChunkPos) (offset, size 
 	if err := db.StoreColumn(pos, world.Overworld, recoveryTestColumn()); err != nil {
 		t.Fatal(err)
 	}
-	offset, size, ok := db.index.get(chunkKey{pos: pos, dim: world.Overworld})
+	offset, size, ok := db.index.get(newChunkKey(pos, world.Overworld))
 	if !ok {
 		t.Fatalf("index missing stored chunk %v", pos)
 	}
@@ -116,7 +116,7 @@ func TestRebuildIndexKeepsLatestChunkVersion(t *testing.T) {
 	db = openRecoveryDB(t, dir)
 	defer db.Close()
 
-	offset, _, ok := db.index.get(chunkKey{pos: pos, dim: world.Overworld})
+	offset, _, ok := db.index.get(newChunkKey(pos, world.Overworld))
 	if !ok {
 		t.Fatal("rebuilt index missing chunk")
 	}
@@ -154,7 +154,7 @@ func TestRebuildIndexSkipsBadChecksumRecord(t *testing.T) {
 	db = openRecoveryDB(t, dir)
 	defer db.Close()
 
-	offset, _, ok := db.index.get(chunkKey{pos: pos, dim: world.Overworld})
+	offset, _, ok := db.index.get(newChunkKey(pos, world.Overworld))
 	if !ok {
 		t.Fatal("rebuilt index missing previous valid chunk version")
 	}
@@ -260,6 +260,46 @@ func TestSafeDurabilityDisablesWriteBuffer(t *testing.T) {
 	}
 	if db.conf.Options.FlushInterval != 0 {
 		t.Fatalf("safe durability should disable periodic flushing, got %d", db.conf.Options.FlushInterval)
+	}
+}
+
+func TestFlushWriteBufferRetainsWritesOnWriteError(t *testing.T) {
+	opts := DefaultOptions()
+	opts.WriteBufferSize = 4 * 1024 * 1024
+	opts.FlushInterval = 0
+	opts.Log = discardTestLogger()
+
+	db, err := Config{Options: opts}.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(db.stopWrite)
+	db.writeWg.Wait()
+	db.prefetcher.Stop()
+
+	key := newChunkKey(world.ChunkPos{11, -3}, world.Overworld)
+	col := recoveryTestColumn()
+	db.writeBufMu.Lock()
+	db.writeBuf[key] = col
+	db.writeBufSize.Store(int64(len(col.Chunk.Sub()) * 4096))
+	db.writeBufMu.Unlock()
+
+	if err := db.dataFd.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.flushWriteBuffer(); err == nil {
+		t.Fatal("expected flush to fail after closing chunks.dat")
+	}
+
+	db.writeBufMu.Lock()
+	_, retained := db.writeBuf[key]
+	size := db.writeBufSize.Load()
+	db.writeBufMu.Unlock()
+	if !retained {
+		t.Fatal("expected failed flush to retain buffered write")
+	}
+	if size == 0 {
+		t.Fatal("expected retained write to keep buffer size accounting")
 	}
 }
 

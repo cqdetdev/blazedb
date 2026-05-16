@@ -23,7 +23,7 @@ func newNegativeCache() *negativeCache {
 }
 
 func (c *negativeCache) shard(key chunkKey) *negativeCacheShard {
-	h := uint32(key.pos[0])*31 + uint32(key.pos[1])
+	h := uint32(key.x)*31 + uint32(key.z) + uint32(key.dimID)*131
 	return &c.shards[h&(negativeCacheShardCount-1)]
 }
 

@@ -48,6 +48,7 @@ type DB struct {
 	writeBuf     map[chunkKey]*chunk.Column
 	flushingBuf  map[chunkKey]*chunk.Column
 	writeBufMu   sync.Mutex
+	flushMu      sync.Mutex
 	writeBufSize atomic.Int64 // Estimated buffer size tracking
 	flushTimer   *time.Timer
 	stopFlush    chan struct{}
@@ -209,7 +210,9 @@ func (db *DB) startPeriodicFlush() {
 		for {
 			select {
 			case <-db.flushTimer.C:
-				db.flushWriteBuffer()
+				if err := db.flushWriteBuffer(); err != nil {
+					db.conf.Options.Log.Error("periodic flush", "error", err)
+				}
 				db.flushTimer.Reset(interval)
 			case <-db.stopFlush:
 				db.flushTimer.Stop()
@@ -228,29 +231,24 @@ func (db *DB) startWriteWorker() {
 			select {
 			case req := <-db.writeQueue:
 				// Process write request - add to buffer
-				db.writeBufMu.Lock()
-				estimatedSize := int64(len(req.col.Chunk.Sub()) * 4096)
-				if _, exists := db.writeBuf[req.key]; !exists {
-					db.writeBufSize.Add(estimatedSize)
-				}
-				db.writeBuf[req.key] = req.col
-				bufSize := db.writeBufSize.Load()
-				db.writeBufMu.Unlock()
+				bufSize := db.bufferWrite(req.key, req.col)
 
 				// Flush if buffer exceeds size limit
 				if bufSize >= db.conf.Options.WriteBufferSize {
-					db.flushWriteBuffer()
+					if err := db.flushWriteBuffer(); err != nil {
+						db.conf.Options.Log.Error("write buffer flush", "error", err)
+					}
 				}
 			case <-db.stopWrite:
 				// Drain remaining writes before stopping
 				for {
 					select {
 					case req := <-db.writeQueue:
-						db.writeBufMu.Lock()
-						db.writeBuf[req.key] = req.col
-						db.writeBufMu.Unlock()
+						db.bufferWrite(req.key, req.col)
 					default:
-						db.flushWriteBuffer()
+						if err := db.flushWriteBuffer(); err != nil {
+							db.conf.Options.Log.Error("final write buffer flush", "error", err)
+						}
 						return
 					}
 				}
@@ -260,11 +258,14 @@ func (db *DB) startWriteWorker() {
 }
 
 // flushWriteBuffer writes all buffered chunks to disk with lazy encoding.
-func (db *DB) flushWriteBuffer() {
+func (db *DB) flushWriteBuffer() error {
+	db.flushMu.Lock()
+	defer db.flushMu.Unlock()
+
 	db.writeBufMu.Lock()
 	if len(db.writeBuf) == 0 {
 		db.writeBufMu.Unlock()
-		return
+		return nil
 	}
 
 	// Copy buffer and clear
@@ -278,8 +279,11 @@ func (db *DB) flushWriteBuffer() {
 	defer db.clearFlushingBuffer(toWrite)
 
 	writes := db.encodePendingWrites(toWrite)
+	if len(writes) != len(toWrite) {
+		db.requeueUnencodedWrites(toWrite, writes)
+	}
 	if len(writes) == 0 {
-		return
+		return fmt.Errorf("flush: no chunks encoded")
 	}
 
 	totalSize := 0
@@ -308,18 +312,63 @@ func (db *DB) flushWriteBuffer() {
 	}
 
 	if _, err := db.dataFd.WriteAt(batch, offset); err != nil {
-		db.conf.Options.Log.Error("flush: write chunk batch", "error", err)
-		return
+		db.requeueWrites(toWrite)
+		if truncateErr := db.truncateDataFile(offset); truncateErr != nil {
+			return fmt.Errorf("flush: write chunk batch: %w; additionally failed to truncate failed batch: %v", err, truncateErr)
+		}
+		return fmt.Errorf("flush: write chunk batch: %w", err)
 	}
 	if err := db.syncDataFile("flush"); err != nil {
-		db.conf.Options.Log.Error("flush: sync chunk batch", "error", err)
+		db.requeueWrites(toWrite)
+		if truncateErr := db.truncateDataFile(offset); truncateErr != nil {
+			return fmt.Errorf("%w; additionally failed to truncate unsynced batch: %v", err, truncateErr)
+		}
+		return err
 	}
 
 	offset += int64(len(batch))
 	db.fileOffset.Store(offset)
 	db.index.putBatch(updates)
+	return nil
+}
+
+func (db *DB) bufferWrite(key chunkKey, col *chunk.Column) int64 {
+	db.writeBufMu.Lock()
+	defer db.writeBufMu.Unlock()
+
+	estimatedSize := int64(len(col.Chunk.Sub()) * 4096)
+	if _, exists := db.writeBuf[key]; !exists {
+		db.writeBufSize.Add(estimatedSize)
+	}
+	db.writeBuf[key] = col
+	return db.writeBufSize.Load()
+}
+
+func (db *DB) requeueUnencodedWrites(toWrite map[chunkKey]*chunk.Column, writes []pendingWrite) {
+	encoded := make(map[chunkKey]struct{}, len(writes))
 	for _, write := range writes {
-		db.cache.markClean(write.key)
+		encoded[write.key] = struct{}{}
+	}
+	failed := make(map[chunkKey]*chunk.Column, len(toWrite)-len(encoded))
+	for key, col := range toWrite {
+		if _, ok := encoded[key]; !ok {
+			failed[key] = col
+		}
+	}
+	db.requeueWrites(failed)
+}
+
+func (db *DB) requeueWrites(toWrite map[chunkKey]*chunk.Column) {
+	db.writeBufMu.Lock()
+	defer db.writeBufMu.Unlock()
+
+	for key, col := range toWrite {
+		if _, exists := db.writeBuf[key]; exists {
+			continue
+		}
+		estimatedSize := int64(len(col.Chunk.Sub()) * 4096)
+		db.writeBufSize.Add(estimatedSize)
+		db.writeBuf[key] = col
 	}
 }
 
@@ -354,7 +403,7 @@ func (db *DB) encodePendingWrites(toWrite map[chunkKey]*chunk.Column) []pendingW
 			defer wg.Done()
 			for idx := range jobs {
 				task := tasks[idx]
-				data, err := db.encodeColumn(task.key.pos, task.key.dim, task.col)
+				data, err := db.encodeColumnForKey(task.key, task.col)
 				if err != nil {
 					db.conf.Options.Log.Error("flush: encode chunk", "error", err)
 					continue
@@ -387,7 +436,7 @@ func (db *DB) encodePendingWrites(toWrite map[chunkKey]*chunk.Column) []pendingW
 func (db *DB) encodePendingWritesSequential(tasks []pendingEncode) []pendingWrite {
 	writes := make([]pendingWrite, 0, len(tasks))
 	for _, task := range tasks {
-		data, err := db.encodeColumn(task.key.pos, task.key.dim, task.col)
+		data, err := db.encodeColumnForKey(task.key, task.col)
 		if err != nil {
 			db.conf.Options.Log.Error("flush: encode chunk", "error", err)
 			continue
@@ -443,7 +492,7 @@ func (db *DB) SavePlayerSpawnPosition(id uuid.UUID, pos cube.Pos) error {
 // LoadColumn reads a chunk.Column from the DB at a position and dimension.
 // If no column at that position exists, errors.Is(err, ErrNotFound) equals true.
 func (db *DB) LoadColumn(pos world.ChunkPos, dim world.Dimension) (*chunk.Column, error) {
-	key := chunkKey{pos: pos, dim: dim}
+	key := newChunkKey(pos, dim)
 
 	// Check cache first (no lock needed - cache is thread-safe)
 	if col := db.cache.get(key); col != nil {
@@ -500,11 +549,16 @@ func (db *DB) loadColumnAfterCacheMiss(key chunkKey, dim world.Dimension) (*chun
 
 // StoreColumn stores a chunk.Column at a position and dimension in the DB.
 func (db *DB) StoreColumn(pos world.ChunkPos, dim world.Dimension, col *chunk.Column) error {
-	key := chunkKey{pos: pos, dim: dim}
+	key := newChunkKey(pos, dim)
 
 	// Update cache immediately
 	db.misses.delete(key)
 	db.cache.put(key, col)
+
+	if db.conf.Options.Durability == DurabilitySafeBatch {
+		db.bufferWrite(key, col)
+		return db.flushWriteBuffer()
+	}
 
 	// If write buffering is enabled, send to async write queue (non-blocking)
 	if db.conf.Options.WriteBufferSize > 0 {
@@ -513,13 +567,7 @@ func (db *DB) StoreColumn(pos world.ChunkPos, dim world.Dimension, col *chunk.Co
 			// Successfully queued
 		default:
 			// Queue full - add directly to buffer (fallback)
-			db.writeBufMu.Lock()
-			estimatedSize := int64(len(col.Chunk.Sub()) * 4096)
-			if _, exists := db.writeBuf[key]; !exists {
-				db.writeBufSize.Add(estimatedSize)
-			}
-			db.writeBuf[key] = col
-			db.writeBufMu.Unlock()
+			db.bufferWrite(key, col)
 		}
 		return nil
 	}
@@ -546,7 +594,6 @@ func (db *DB) StoreColumn(pos world.ChunkPos, dim world.Dimension, col *chunk.Co
 	if err := db.syncDataFile("store chunk"); err != nil {
 		return err
 	}
-	db.cache.markClean(key)
 
 	return nil
 }
@@ -560,10 +607,7 @@ func (db *DB) LoadArea(center world.ChunkPos, radius int, dim world.Dimension) (
 
 	for dx := -radius; dx <= radius; dx++ {
 		for dz := -radius; dz <= radius; dz++ {
-			key := chunkKey{
-				pos: world.ChunkPos{center[0] + int32(dx), center[1] + int32(dz)},
-				dim: dim,
-			}
+			key := newChunkKey(world.ChunkPos{center[0] + int32(dx), center[1] + int32(dz)}, dim)
 			if col := db.cache.get(key); col != nil {
 				columns = append(columns, col)
 				continue
@@ -635,13 +679,23 @@ func (db *DB) LoadArea(center world.ChunkPos, radius int, dim world.Dimension) (
 
 // encodeColumn encodes a chunk column to compressed bytes.
 func (db *DB) encodeColumn(pos world.ChunkPos, dim world.Dimension, col *chunk.Column) ([]byte, error) {
+	dimID, _ := world.DimensionID(dim)
+	return db.encodeColumnWithDimID(pos, int32(dimID), col)
+}
+
+func (db *DB) encodeColumnForKey(key chunkKey, col *chunk.Column) ([]byte, error) {
+	return db.encodeColumnWithDimID(key.pos(), key.dimID, col)
+}
+
+func (db *DB) encodeColumnWithDimID(pos world.ChunkPos, dimID int32, col *chunk.Column) ([]byte, error) {
 	// Encode chunk data
 	data := chunk.Encode(col.Chunk, chunk.DiskEncoding)
 
-	capacity := 26 + len(data.Biomes)
+	capacity := chunkRecordHeaderSize + 4 + compressedBound(len(data.Biomes), db.conf.Options.Compression)
 	for _, sub := range data.SubChunks {
-		capacity += 4 + len(sub)
+		capacity += 4 + compressedBound(len(sub), db.conf.Options.Compression)
 	}
+	capacity += 12
 	buf := make([]byte, 0, capacity)
 
 	// Write header: "BLAZ" magic
@@ -660,7 +714,6 @@ func (db *DB) encodeColumn(pos world.ChunkPos, dim world.Dimension, col *chunk.C
 	buf = binary.LittleEndian.AppendUint32(buf, uint32(pos[1]))
 
 	// Write dimension ID
-	dimID, _ := world.DimensionID(dim)
 	buf = binary.LittleEndian.AppendUint32(buf, uint32(dimID))
 
 	// Write compression type
@@ -675,13 +728,11 @@ func (db *DB) encodeColumn(pos world.ChunkPos, dim world.Dimension, col *chunk.C
 	}
 
 	// Compress and write biomes
-	compressedBiomes := compress(data.Biomes, db.conf.Options.Compression)
-	appendBytes(compressedBiomes)
+	buf = appendCompressed(buf, data.Biomes, db.conf.Options.Compression)
 
 	// Compress and write each subchunk
 	for _, sub := range data.SubChunks {
-		compressedSub := compress(sub, db.conf.Options.Compression)
-		appendBytes(compressedSub)
+		buf = appendCompressed(buf, sub, db.conf.Options.Compression)
 	}
 
 	// Encode entities
@@ -1008,18 +1059,16 @@ func (db *DB) rebuildIndex() error {
 		}
 
 		dimID := int(int32(binary.LittleEndian.Uint32(record[20:24])))
-		dim, ok := world.DimensionByID(dimID)
+		_, ok := world.DimensionByID(dimID)
 		if !ok {
 			db.conf.Options.Log.Warn("skipping chunk with unknown dimension", "offset", offset, "dimension", dimID)
 			offset += size
 			continue
 		}
 		key := chunkKey{
-			pos: world.ChunkPos{
-				int32(binary.LittleEndian.Uint32(record[12:16])),
-				int32(binary.LittleEndian.Uint32(record[16:20])),
-			},
-			dim: dim,
+			x:     int32(binary.LittleEndian.Uint32(record[12:16])),
+			z:     int32(binary.LittleEndian.Uint32(record[16:20])),
+			dimID: int32(dimID),
 		}
 		morton, indexDimID := indexLookupKey(key)
 		idx.entries[indexKey{morton: morton, dim: indexDimID}] = indexEntry{
@@ -1125,7 +1174,9 @@ func (db *DB) Prefetcher() *Prefetcher {
 
 // Compact performs background compaction to optimize storage.
 func (db *DB) Compact() error {
-	db.flushWriteBuffer()
+	if err := db.flushWriteBuffer(); err != nil {
+		return err
+	}
 
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -1215,7 +1266,9 @@ func (db *DB) Close() error {
 	}
 
 	// Flush any remaining writes
-	db.flushWriteBuffer()
+	if err := db.flushWriteBuffer(); err != nil {
+		return err
+	}
 
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -1259,8 +1312,23 @@ func (db *DB) Close() error {
 
 // chunkKey uniquely identifies a chunk by position and dimension.
 type chunkKey struct {
-	pos world.ChunkPos
-	dim world.Dimension
+	x     int32
+	z     int32
+	dimID int32
+}
+
+func newChunkKey(pos world.ChunkPos, dim world.Dimension) chunkKey {
+	dimID, _ := world.DimensionID(dim)
+	return chunkKey{x: pos[0], z: pos[1], dimID: int32(dimID)}
+}
+
+func (key chunkKey) pos() world.ChunkPos {
+	return world.ChunkPos{key.x, key.z}
+}
+
+func (key chunkKey) dimension() world.Dimension {
+	dim, _ := world.DimensionByID(int(key.dimID))
+	return dim
 }
 
 // Stats holds performance statistics for the database.

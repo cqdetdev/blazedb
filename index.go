@@ -102,10 +102,8 @@ func mortonDecode(code uint64) (x, z int32) {
 
 // makeKey creates an index key from chunk position and dimension.
 func makeKey(key chunkKey) (uint64, int32) {
-	dimID, _ := world.DimensionID(key.dim)
-	morton := mortonEncode(key.pos[0], key.pos[1])
-	// Combine Morton code with dimension in high bits
-	return morton, int32(dimID)
+	morton := mortonEncode(key.x, key.z)
+	return morton, key.dimID
 }
 
 func indexLookupKey(key chunkKey) (uint64, int32) {
@@ -393,11 +391,10 @@ func (idx *spatialIndex) iterate(fn func(key chunkKey, offset, size int64) bool)
 
 		x, z := mortonDecode(idxKey.morton)
 
-		dim, _ := world.DimensionByID(int(idxKey.dim))
-		chunk := chunkKey{
-			pos: world.ChunkPos{x, z},
-			dim: dim,
+		if _, ok := world.DimensionByID(int(idxKey.dim)); !ok {
+			continue
 		}
+		chunk := chunkKey{x: x, z: z, dimID: idxKey.dim}
 
 		if !fn(chunk, entry.offset, entry.size) {
 			return

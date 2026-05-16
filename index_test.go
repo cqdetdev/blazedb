@@ -9,9 +9,9 @@ import (
 func TestSpatialIndexPreservesCoordinatesAndDimensions(t *testing.T) {
 	idx := newSpatialIndex()
 	keys := []chunkKey{
-		{pos: world.ChunkPos{-1024, 512}, dim: world.Overworld},
-		{pos: world.ChunkPos{-1024, 512}, dim: world.Nether},
-		{pos: world.ChunkPos{2048, -4096}, dim: world.End},
+		newChunkKey(world.ChunkPos{-1024, 512}, world.Overworld),
+		newChunkKey(world.ChunkPos{-1024, 512}, world.Nether),
+		newChunkKey(world.ChunkPos{2048, -4096}, world.End),
 	}
 
 	for i, key := range keys {
